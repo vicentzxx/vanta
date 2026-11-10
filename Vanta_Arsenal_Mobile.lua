@@ -1,7 +1,8 @@
--- VANTA Mobile | Luau / Roblox client
--- Execute o arquivo inteiro. Mira e ESP comecam desligados.
+-- VANTA Mobile v1.1 | Luau / Roblox client
+-- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Compativel com APIs padrao do cliente; nao testado no Arsenal/executores.
--- X encerra e limpa os objetos/conexoes. Executar novamente substitui a UI.
+-- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
+-- X desativa os recursos e limpa a UI/conexoes. O hook, se instalado, fica inerte.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -16,6 +17,7 @@ assert(playerGui, "PlayerGui indisponivel. Entre no jogo e tente novamente.")
 local Config = {
     Aim = false,
     ESP = false,
+    AntiKick = false,
     WallCheck = true,
     TeamCheck = true,
     FOV = 150,           -- Raio em pixels, a partir do centro da tela.
@@ -49,6 +51,103 @@ local active = true
 local target = nil
 local scanElapsed = Config.ScanInterval
 local espElapsed = Config.ESPInterval
+
+-- BEGIN LOCAL_KICK_GUARD
+-- Modulo isolado para chamadas locais de Player:Kick(). Sem downloads externos.
+local function makeLocalKickGuard(gameObject, localPlayer, hooks)
+    local guard = { enabled = false, installed = false, blocked = 0, error = nil }
+    local stopped = false
+    local attempted = false
+
+    function guard:SetEnabled(wanted)
+        if stopped then
+            return false, "Recurso encerrado. Execute o script novamente."
+        end
+        if not wanted then
+            self.enabled = false
+            return true
+        end
+        if self.installed then
+            self.enabled = true
+            return true
+        end
+        if attempted then
+            return false, self.error
+        end
+        attempted = true
+
+        local hook = hooks.hookmetamethod
+        local getMethod = hooks.getnamecallmethod
+        local ownCaller = hooks.checkcaller
+        local wrap = hooks.newcclosure
+        local getMeta = hooks.getrawmetatable
+        if type(hook) ~= "function" or type(getMethod) ~= "function"
+            or type(ownCaller) ~= "function" or type(wrap) ~= "function"
+            or type(getMeta) ~= "function" then
+            self.error = "Executor sem suporte ao Anti-Kick local."
+            return false, self.error
+        end
+
+        -- Captura o destino anterior antes de instalar, para manter o encaminhamento
+        -- mesmo quando um executor falha durante a instalacao ou retorna um valor invalido.
+        local metaOK, meta = pcall(getMeta, gameObject)
+        local previous = metaOK and type(meta) == "table" and rawget(meta, "__namecall")
+        if type(previous) ~= "function" then
+            self.error = "Nao foi possivel obter o metodo original."
+            return false, self.error
+        end
+
+        local function handler(object, ...)
+            if not stopped and guard.enabled and object == localPlayer then
+                local methodOK, method = pcall(getMethod)
+                if methodOK and (method == "Kick" or method == "kick") then
+                    local callerOK, isOwn = pcall(ownCaller)
+                    if callerOK and isOwn == false then
+                        guard.blocked = guard.blocked + 1
+                        return nil
+                    end
+                end
+            end
+            return previous(object, ...)
+        end
+
+        local wrapOK, wrapped = pcall(wrap, handler)
+        if not wrapOK or type(wrapped) ~= "function" then
+            self.error = "Executor nao conseguiu preparar o Anti-Kick local."
+            return false, self.error
+        end
+        local hookOK, original = pcall(hook, gameObject, "__namecall", wrapped)
+        if not hookOK or type(original) ~= "function" or original == wrapped then
+            -- O handler continua desligado e encaminha ao metodo previamente capturado.
+            self.error = "Executor nao confirmou a instalacao do Anti-Kick local."
+            return false, self.error
+        end
+        previous = original
+        self.installed = true
+        self.enabled = true
+        return true
+    end
+
+    function guard:Shutdown()
+        self.enabled = false
+        stopped = true
+        -- Nao substitui novamente o __namecall: outros scripts podem ter instalado
+        -- hooks depois deste. A funcao inerte apenas encaminha ao destino anterior.
+    end
+
+    return guard
+end
+-- END LOCAL_KICK_GUARD
+
+local kickGuard = makeLocalKickGuard(game, player, {
+    hookmetamethod = hookmetamethod,
+    getnamecallmethod = getnamecallmethod,
+    checkcaller = checkcaller,
+    newcclosure = newcclosure,
+    getrawmetatable = getrawmetatable,
+})
+local kickNotice = nil
+local kickNoticeUntil = 0
 
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
@@ -99,6 +198,8 @@ local function shutdown()
         return
     end
     active = false
+    Config.AntiKick = false
+    kickGuard:Shutdown()
     RunService:UnbindFromRenderStep(RENDER_NAME)
     for _, connection in ipairs(connections) do
         connection:Disconnect()
@@ -129,7 +230,7 @@ local ringStroke = make("UIStroke", {
 local panel = make("Frame", {
     Name = "Panel",
     Position = UDim2.new(1, -252, 0, 48),
-    Size = UDim2.fromOffset(236, 292),
+    Size = UDim2.fromOffset(236, 332),
     BackgroundColor3 = Color3.fromRGB(20, 22, 31),
     BorderSizePixel = 0,
     Active = true,
@@ -172,17 +273,18 @@ local minimize = button(panel, "-", UDim2.fromOffset(28, 28), UDim2.fromOffset(1
 local close = button(panel, "X", UDim2.fromOffset(28, 28), UDim2.fromOffset(202, 6))
 local body = make("Frame", {
     Position = UDim2.fromOffset(10, 44),
-    Size = UDim2.fromOffset(216, 238),
+    Size = UDim2.fromOffset(216, 278),
     BackgroundTransparency = 1,
     ZIndex = 3,
 }, panel)
 local aimButton = button(body, "Mira: OFF", UDim2.fromOffset(216, 34))
 local espButton = button(body, "ESP: OFF", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 40))
 local wallButton = button(body, "Checar paredes: ON", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 80))
-local less = button(body, "-", UDim2.fromOffset(38, 32), UDim2.fromOffset(0, 120))
-local more = button(body, "+", UDim2.fromOffset(38, 32), UDim2.fromOffset(178, 120))
+local kickButton = button(body, "Anti-Kick local: OFF", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 120))
+local less = button(body, "-", UDim2.fromOffset(38, 32), UDim2.fromOffset(0, 160))
+local more = button(body, "+", UDim2.fromOffset(38, 32), UDim2.fromOffset(178, 160))
 local fovLabel = make("TextLabel", {
-    Position = UDim2.fromOffset(42, 120),
+    Position = UDim2.fromOffset(42, 160),
     Size = UDim2.fromOffset(132, 32),
     BackgroundTransparency = 1,
     Text = "FOV: " .. Config.FOV,
@@ -192,7 +294,7 @@ local fovLabel = make("TextLabel", {
     ZIndex = 3,
 }, body)
 local status = make("TextLabel", {
-    Position = UDim2.fromOffset(0, 158),
+    Position = UDim2.fromOffset(0, 198),
     Size = UDim2.fromOffset(216, 44),
     BackgroundTransparency = 1,
     Text = "Alvo: nenhum",
@@ -203,10 +305,10 @@ local status = make("TextLabel", {
     ZIndex = 3,
 }, body)
 make("TextLabel", {
-    Position = UDim2.fromOffset(0, 204),
+    Position = UDim2.fromOffset(0, 244),
     Size = UDim2.fromOffset(216, 30),
     BackgroundTransparency = 1,
-    Text = "Arraste o titulo para mover.\nMira acompanha o centro da tela.",
+    Text = "Arraste o titulo para mover.\nAnti-Kick local nao impede banimento.",
     TextWrapped = true,
     Font = Enum.Font.Gotham,
     TextSize = 11,
@@ -223,6 +325,10 @@ local function refreshUI()
     paintButton(aimButton, Config.Aim, "Mira")
     paintButton(espButton, Config.ESP, "ESP")
     paintButton(wallButton, Config.WallCheck, "Checar paredes")
+    paintButton(kickButton, kickGuard.enabled, "Anti-Kick local")
+    if kickGuard.error then
+        kickButton.Text = "Anti-Kick: indisponivel"
+    end
     fovLabel.Text = "FOV: " .. Config.FOV
     ring.Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
     ring.Visible = Config.Aim
@@ -249,6 +355,19 @@ connect(wallButton.Activated, function()
     scanElapsed = Config.ScanInterval
     refreshUI()
 end)
+connect(kickButton.Activated, function()
+    local wanted = not kickGuard.enabled
+    local ok, reason = kickGuard:SetEnabled(wanted)
+    Config.AntiKick = kickGuard.enabled
+    if not ok then
+        kickNotice = reason or "Anti-Kick local indisponivel."
+        kickNoticeUntil = os.clock() + 6
+        warn("VANTA: " .. kickNotice)
+    else
+        kickNotice = nil
+    end
+    refreshUI()
+end)
 connect(less.Activated, function()
     Config.FOV = math.clamp(Config.FOV - 25, 50, 350)
     target = nil
@@ -263,7 +382,7 @@ local collapsed = false
 connect(minimize.Activated, function()
     collapsed = not collapsed
     body.Visible = not collapsed
-    panel.Size = UDim2.fromOffset(236, collapsed and 40 or 292)
+    panel.Size = UDim2.fromOffset(236, collapsed and 40 or 332)
     minimize.Text = collapsed and "+" or "-"
 end)
 connect(close.Activated, shutdown)
@@ -475,7 +594,15 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
     if espElapsed >= Config.ESPInterval then
         espElapsed = 0
         updateESP(camera)
-        status.Text = target and ("Alvo: @" .. target.Name) or "Alvo: nenhum"
+        if kickNotice and os.clock() < kickNoticeUntil then
+            status.Text = kickNotice
+        else
+            local targetText = target and ("Alvo: @" .. target.Name) or "Alvo: nenhum"
+            status.Text = targetText
+            if kickGuard.enabled then
+                status.Text = targetText .. "\nChamadas locais bloqueadas: " .. kickGuard.blocked
+            end
+        end
     end
 end)
 
