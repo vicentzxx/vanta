@@ -1,4 +1,4 @@
--- VANTA BloxStrike v0.5 TESTE | Luau / Roblox client
+-- VANTA BloxStrike v0.6 TESTE | Luau / Roblox client
 -- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Adaptacao experimental; ainda sem teste real no BloxStrike/executores.
 -- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
@@ -8,6 +8,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- Universo da experiencia oficial: inclui seus diferentes places.
 assert(game.GameId == 7633926880, "VANTA BloxStrike: entre na experiencia BloxStrike antes de executar.")
@@ -26,6 +27,7 @@ local Config = {
     FOV = 150,           -- Raio em pixels, a partir do centro da tela.
     MaxDistance = 2500,  -- Alcance da mira em studs.
     ESPMaxDistance = 2500, -- Alcance independente do ESP; ajustavel no painel.
+    ESPLastKnownDuration = 3, -- Posicao anterior claramente marcada, nunca usada pela mira.
     AimStrength = 100,   -- 20 a 100. Em Camera, 100 centraliza diretamente no alvo.
     AimInput = "Camera", -- Camera por padrao; evita assumir semantica de mousemoverel no Xeno.
     ScanInterval = 0.03,
@@ -52,6 +54,7 @@ end
 
 local connections = {}
 local espItems = {}
+local espMemory = {}
 local active = true
 local target = nil
 local scanElapsed = Config.ScanInterval
@@ -158,7 +161,7 @@ local inputNotice = nil
 local inputNoticeUntil = 0
 local espNotice = nil
 local espNoticeUntil = 0
-local espCounters = { compatible = 0, drawn = 0, unknown = 0 }
+local espCounters = { compatible = 0, drawn = 0, unknown = 0, culled = 0, lastKnown = 0 }
 local resolveCharacter
 local frameData -- Somente referencias/atributos do quadro atual; nunca conserva posicoes antigas.
 
@@ -383,6 +386,9 @@ local function clearESP()
     espCounters.compatible = 0
     espCounters.drawn = 0
     espCounters.unknown = 0
+    espCounters.culled = 0
+    espCounters.lastKnown = 0
+    espMemory = {}
 end
 
 local function shutdown()
@@ -436,7 +442,7 @@ local dragHandle = make("TextLabel", {
     Size = UDim2.fromOffset(154, 40),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "VANTA | BLOX v0.5",
+    Text = "VANTA | BLOX v0.6",
     TextColor3 = Color3.fromRGB(240, 240, 248),
     Font = Enum.Font.GothamBold,
     TextSize = 13,
@@ -467,7 +473,7 @@ local close = button(panel, "X", UDim2.fromOffset(28, 28), UDim2.fromOffset(202,
 local body = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 44),
     Size = UDim2.fromOffset(216, panelHeight - 54),
-    CanvasSize = UDim2.fromOffset(0, 520),
+    CanvasSize = UDim2.fromOffset(0, 540),
     ScrollBarThickness = 3,
     ScrollingDirection = Enum.ScrollingDirection.Y,
     BorderSizePixel = 0,
@@ -518,7 +524,7 @@ local espDistanceLabel = make("TextLabel", {
 }, body)
 local status = make("TextLabel", {
     Position = UDim2.fromOffset(0, 358),
-    Size = UDim2.fromOffset(216, 78),
+    Size = UDim2.fromOffset(216, 94),
     BackgroundTransparency = 1,
     Text = "Alvo: nenhum",
     TextWrapped = true,
@@ -527,9 +533,9 @@ local status = make("TextLabel", {
     TextColor3 = Color3.fromRGB(211, 211, 228),
     ZIndex = 3,
 }, body)
-local diagnosticButton = button(body, "Copiar diagnostico", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 440))
+local diagnosticButton = button(body, "Copiar diagnostico", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 460))
 make("TextLabel", {
-    Position = UDim2.fromOffset(0, 480),
+    Position = UDim2.fromOffset(0, 500),
     Size = UDim2.fromOffset(216, 34),
     BackgroundTransparency = 1,
     Text = "Versao de teste. Arraste o titulo.\nAnti-Kick local nao impede banimento.",
@@ -711,6 +717,15 @@ local function worldCharacter(character)
         and type(character.IsDescendantOf) == "function" and character:IsDescendantOf(Workspace)
 end
 
+local function culledCharacter(other)
+    local folder = ReplicatedStorage:FindFirstChild("_PVS_CulledCharacters")
+    local character = other.Character
+    if folder and character and character.Parent and character:IsDescendantOf(folder) then
+        return character
+    end
+    return nil
+end
+
 local function bodyPartBelongs(part, character)
     if not part or not part.Parent or not part:IsA("BasePart") or not part:IsDescendantOf(character) then
         return false
@@ -817,10 +832,11 @@ end
 -- BEGIN PLAYER_OBSERVATION
 local function getEnemy(other)
     if other == player or other.Parent ~= Players then
-        return nil
+        return nil, nil, nil, "jogador invalido"
     end
     local enemy = teamRelation(player, other, Config.MyTeam)
-    if enemy ~= true then return nil end
+    if enemy ~= true then return nil, nil, nil, enemy == nil and "equipe desconhecida" or "aliado" end
+    if culledCharacter(other) then return nil, nil, nil, "oculto pelo jogo (PVS)" end
     return characterParts(other)
 end
 
@@ -844,6 +860,7 @@ local function getESPCharacter(other)
     local enemy = teamRelation(player, other, Config.MyTeam)
     local relation = espRelation(enemy)
     if not relation then return nil, nil, nil, enemy == nil and "unknown" or "ally" end
+    if culledCharacter(other) then return nil, nil, nil, "culled" end
     local character, humanoid, part = characterParts(other)
     if not character then return nil end
     return character, humanoid, part, relation
@@ -855,39 +872,47 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
+local function auxiliaryPart(part)
+    if not part or type(part.IsA) ~= "function" or not part:IsA("BasePart") then return false end
+    -- Ignora somente auxiliares invisiveis E sem colisao. Paredes visiveis,
+    -- vidro e barreiras com colisao continuam bloqueando o percurso.
+    return part.CanCollide == false and ((finiteHealth(part.Transparency) or 0) >= 0.99
+        or (finiteHealth(part.LocalTransparencyModifier) or 0) >= 0.99)
+end
+
 local function lineOfSight(camera, character, part)
     if not worldCharacter(character) or not bodyPartBelongs(part, character) then return false, "corpo invalido" end
     local origin, position = camera.CFrame.Position, part.Position
     local cached = frameData and frameData.visibility[part]
     if cached and cached.origin == origin and cached.position == position and cached.character == character then
-        return cached.clear, cached.reason
+        return cached.clear, cached.reason, cached.blocker
     end
-    local function result(clear, reason)
+    local function result(clear, reason, blocker)
         if frameData then
             frameData.visibility[part] = { origin = origin, position = position, character = character,
-                clear = clear, reason = reason }
+                clear = clear, reason = reason, blocker = blocker }
         end
-        return clear, reason
+        return clear, reason, blocker
     end
     -- Ignorar o proprio alvo permite testar o percurso inteiro ate sua posicao,
     -- sem aceitar um hitbox externo que intercepte o raio antes de uma parede.
     local ignore = { camera, character }
     local localCharacter = resolveCharacter(player)
     if localCharacter then table.insert(ignore, localCharacter) end
-    rayParams.FilterDescendantsInstances = ignore
-    local rayOK, hit = pcall(Workspace.Raycast, Workspace, origin, position - origin, rayParams)
-    if not rayOK then return result(false, "consulta falhou") end
-    if hit ~= nil then return result(false, "parede/obstaculo") end
-
-    -- Consulta complementar da camera; continua sem bloquear o desenho do ESP.
-    local cameraOK, blockers = pcall(camera.GetPartsObscuringTarget, camera, { position }, ignore)
-    if not cameraOK then return result(false, "consulta da camera falhou") end
-    for _, blocker in ipairs(blockers) do
-        if blocker.Transparency < 1 and blocker.LocalTransparencyModifier < 1 then
-            return result(false, "parede/obstaculo")
+    local seen = {}
+    for attempt = 1, 9 do
+        rayParams.FilterDescendantsInstances = ignore
+        local rayOK, hit = pcall(Workspace.Raycast, Workspace, origin, position - origin, rayParams)
+        if not rayOK then return result(false, "consulta falhou") end
+        if hit == nil then return result(true, "livre") end
+        local blocker = hit.Instance
+        if not auxiliaryPart(blocker) then return result(false, "parede/obstaculo", blocker) end
+        if seen[blocker] or attempt == 9 then
+            return result(false, "consulta inconclusiva", blocker)
         end
+        seen[blocker] = true
+        table.insert(ignore, blocker)
     end
-    return result(true, "livre")
 end
 
 local function visible(camera, character, part)
@@ -926,25 +951,32 @@ end
 
 -- BEGIN TARGET_SELECTOR
 local function targetScore(camera, other)
-    local character, _, head = getEnemy(other)
-    if not character or (head.Position - camera.CFrame.Position).Magnitude > Config.MaxDistance then
-        return nil
-    end
+    local character, _, head, reason = getEnemy(other)
+    if not character then return nil, reason or "sem corpo" end
+    if (head.Position - camera.CFrame.Position).Magnitude > Config.MaxDistance then return nil, "fora do alcance" end
     local center = camera.ViewportSize * 0.5
     local screen, onScreen = camera:WorldToViewportPoint(head.Position)
-    if not onScreen or screen.Z <= 0 then return nil end
+    if not onScreen or screen.Z <= 0 then return nil, "fora da tela" end
     local score = (Vector2.new(screen.X, screen.Y) - center).Magnitude
-    if score > Config.FOV or not visible(camera, character, head) then return nil end
-    return score
+    if score > Config.FOV then return nil, "fora do FOV" end
+    local clear, blockedReason = visible(camera, character, head)
+    if not clear then return nil, blockedReason or "obstaculo" end
+    return score, "elegivel"
+end
+
+local function safeTargetScore(camera, other)
+    local ok, score, reason = pcall(targetScore, camera, other)
+    if not ok then return nil, "falha ao ler corpo" end
+    return score, reason
 end
 
 local function chooseTarget(camera)
     -- Mantem o alvo atual enquanto ele continuar elegivel, evitando trocas constantes.
-    if target and targetScore(camera, target) ~= nil then return target end
+    if target and safeTargetScore(camera, target) ~= nil then return target end
     local chosen = nil
     local best = Config.FOV
     for _, other in ipairs(Players:GetPlayers()) do
-        local score = targetScore(camera, other)
+        local score = safeTargetScore(camera, other)
         if score and score <= best then
             best = score
             chosen = other
@@ -955,62 +987,86 @@ end
 -- END TARGET_SELECTOR
 
 -- BEGIN ESP_RENDERER
-local function updateESPItem(camera, other)
+local function espItem(other, character)
+    local item = espItems[other]
+    if item and item.character ~= character then removeESP(other); item = nil end
+    if item then return item end
+    local box = make("Frame", {
+        Name = "PlayerBox", BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ZIndex = 1,
+    }, espLayer)
+    local outline = make("UIStroke", { Thickness = 1.5, Color = accent }, box)
+    local label = make("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -34),
+        Size = UDim2.fromOffset(220, 32), BackgroundTransparency = 1,
+        TextColor3 = Color3.fromRGB(255, 240, 245), TextStrokeTransparency = 0.1,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true, ZIndex = 1,
+    }, box)
+    item = { character = character, box = box, label = label, outline = outline }
+    espItems[other] = item
+    return item
+end
+
+local function drawESPBox(camera, item, topPosition, bottomPosition, color, text, old)
     local view = camera.ViewportSize
-    local character, humanoid, head, relation = getESPCharacter(other)
+    local top = camera:WorldToViewportPoint(topPosition)
+    local bottom = camera:WorldToViewportPoint(bottomPosition)
+    local x, y, width, height = screenBox(top.X, top.Y, top.Z, bottom.X, bottom.Y, bottom.Z, view.X, view.Y)
+    item.box.Visible = x ~= nil
+    if x == nil then return false end
+    item.box.Position = UDim2.fromOffset(x, y)
+    item.box.Size = UDim2.fromOffset(width, height)
+    item.outline.Color = color
+    item.outline.Transparency = old and 0.45 or 0
+    item.label.TextColor3 = color
+    item.label.TextTransparency = old and 0.25 or 0
+    item.label.Text = text
+    return true
+end
+
+local function updateESPItem(camera, other, now)
+    local character, stats, head, relation = getESPCharacter(other)
     if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
+    if relation == "culled" then
+        espCounters.culled = espCounters.culled + 1
+        local culled = culledCharacter(other)
+        local memory = espMemory[other]
+        local _, dead = lifeData(culled, other)
+        if memory and memory.character == culled and not dead and now >= memory.seenAt
+            and now - memory.seenAt <= Config.ESPLastKnownDuration then
+            if (memory.position - camera.CFrame.Position).Magnitude <= Config.ESPMaxDistance then
+                local age = now - memory.seenAt
+                local text = "@" .. other.Name .. string.format(" [ultima posicao %.1fs]", age)
+                if drawESPBox(camera, espItem(other, culled), memory.top, memory.bottom,
+                    Color3.fromRGB(175, 180, 195), text, true) then
+                    espCounters.lastKnown = espCounters.lastKnown + 1
+                end
+                return
+            end
+        else
+            espMemory[other] = nil
+        end
+        removeESP(other)
+        return
+    end
+
     local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
     if not character or distance > Config.ESPMaxDistance then
+        espMemory[other] = nil
         removeESP(other)
-    else
-        espCounters.compatible = espCounters.compatible + 1
-        local item = espItems[other]
-        if item and item.character ~= character then
-            removeESP(other)
-            item = nil
-        end
-        if not item then
-            local box = make("Frame", {
-                Name = "PlayerBox",
-                BackgroundTransparency = 1,
-                BorderSizePixel = 0,
-                Visible = false,
-                ZIndex = 1,
-            }, espLayer)
-            local outline = make("UIStroke", { Thickness = 1.5, Color = accent }, box)
-            local label = make("TextLabel", {
-                AnchorPoint = Vector2.new(0.5, 0),
-                Position = UDim2.new(0.5, 0, 0, -34),
-                Size = UDim2.fromOffset(200, 32),
-                BackgroundTransparency = 1,
-                TextColor3 = Color3.fromRGB(255, 240, 245),
-                TextStrokeTransparency = 0.1,
-                Font = Enum.Font.GothamBold,
-                TextSize = 12,
-                TextWrapped = true,
-                ZIndex = 1,
-            }, box)
-            item = { character = character, box = box, label = label, outline = outline }
-            espItems[other] = item
-        end
-
-        local topPosition, bottomPosition = espWorldBounds(character, humanoid, head)
-        local top = camera:WorldToViewportPoint(topPosition)
-        local bottom = camera:WorldToViewportPoint(bottomPosition)
-        local x, y, width, height = screenBox(top.X, top.Y, top.Z, bottom.X, bottom.Y, bottom.Z, view.X, view.Y)
-        item.box.Visible = x ~= nil
-        if x ~= nil then
-            item.box.Position = UDim2.fromOffset(x, y)
-            item.box.Size = UDim2.fromOffset(width, height)
-            espCounters.drawn = espCounters.drawn + 1
-            local clear, reason = lineOfSight(camera, character, head)
-            local blocked = reason == "parede/obstaculo"
-            local color = clear and Color3.fromRGB(255, 85, 110) or Color3.fromRGB(255, 190, 80)
-            item.outline.Color = color
-            item.label.TextColor3 = color
-            local suffix = blocked and " [parede]" or (not clear and " [?]" or "")
-            item.label.Text = "@" .. other.Name .. suffix
-        end
+        return
+    end
+    espCounters.compatible = espCounters.compatible + 1
+    local topPosition, bottomPosition = espWorldBounds(character, stats, head)
+    -- Somente um corpo observado no Workspace pode originar uma memoria.
+    -- Alteracoes posteriores no modelo oculto nao sao tratadas como posicao atual.
+    espMemory[other] = { character = character, position = head.Position,
+        top = topPosition, bottom = bottomPosition, seenAt = now }
+    local clear, reason = lineOfSight(camera, character, head)
+    local suffix = reason == "parede/obstaculo" and " [parede]" or (not clear and " [?]" or "")
+    local color = clear and Color3.fromRGB(255, 85, 110) or Color3.fromRGB(255, 190, 80)
+    if drawESPBox(camera, espItem(other, character), topPosition, bottomPosition,
+        color, "@" .. other.Name .. suffix, false) then
+        espCounters.drawn = espCounters.drawn + 1
     end
 end
 
@@ -1018,18 +1074,21 @@ local function hideESP()
     for _, item in pairs(espItems) do item.box.Visible = false end
 end
 
-local function updateESP(camera)
+local function updateESP(camera, now)
+    now = now or os.clock()
     espCounters.compatible, espCounters.drawn, espCounters.unknown = 0, 0, 0
+    espCounters.culled, espCounters.lastKnown = 0, 0
     hideESP()
     if not Config.ESP then return end
     for _, other in ipairs(Players:GetPlayers()) do
-        local ok, reason = pcall(updateESPItem, camera, other)
+        local ok, reason = pcall(updateESPItem, camera, other, now)
         if not ok then
+            espMemory[other] = nil
             removeESP(other)
             if not espNotice or os.clock() >= espNoticeUntil then
                 espNotice = "Um corpo falhou. Copie o diagnostico."
                 espNoticeUntil = os.clock() + 6
-                warn("VANTA ESP v0.5: @" .. other.Name .. ": " .. tostring(reason))
+                warn("VANTA ESP v0.6: @" .. other.Name .. ": " .. tostring(reason))
             end
         end
     end
@@ -1040,29 +1099,55 @@ connect(diagnosticButton.Activated, function()
     -- Leitura pontual nova; o relatorio fica local ate o usuario decidir envia-lo.
     frameData = nil
     local camera = Workspace.CurrentCamera
-    local report = { "VANTA BloxStrike v0.5", "StreamingEnabled=" .. tostring(Workspace.StreamingEnabled),
+    local selfSide = Config.MyTeam ~= "Auto" and normalizeTeam(Config.MyTeam) or readPlayerTeam(player)
+    local selfStats, selfDead = lifeData(resolveCharacter(player), player)
+    local report = { "VANTA BloxStrike v0.6", "StreamingEnabled=" .. tostring(Workspace.StreamingEnabled),
         "WallCheck=" .. tostring(Config.WallCheck) .. " | MinhaEquipe=" .. Config.MyTeam,
+        "EquipeDetectada=" .. tostring(selfSide) .. " | HP local=" .. tostring(selfStats.Health)
+            .. " | Morto=" .. tostring(selfDead),
+        "Mira=" .. tostring(Config.Aim) .. " | Entrada=" .. Config.AimInput .. " | FOV=" .. Config.FOV,
         "AlcanceESP=" .. Config.ESPMaxDistance .. " | AlcanceMira=" .. Config.MaxDistance }
+    local mapped = {}
     for _, other in ipairs(Players:GetPlayers()) do
+        if other.Character then mapped[other.Character] = true end
         if other ~= player then
             local ok, line = pcall(function()
                 local model, stats, part, state = characterParts(other)
                 local side = readPlayerTeam(other)
                 local original = other.Character and other.Character:GetFullName() or "nil"
                 local details = "@" .. other.Name .. " | equipe=" .. tostring(side) .. " | Character=" .. original
-                if not model then return details .. " | " .. tostring(state) end
+                if not model then
+                    return details .. " | " .. (culledCharacter(other) and "oculto pelo jogo (PVS)" or tostring(state))
+                end
+                mapped[model] = true
                 local reason = "sem camera"
+                local eligibility, blocker = "sem camera", nil
                 if camera then
                     local clear
-                    clear, reason = lineOfSight(camera, model, part)
+                    clear, reason, blocker = lineOfSight(camera, model, part)
+                    local score
+                    score, eligibility = safeTargetScore(camera, other)
                 end
+                local blockerName = blocker and blocker:GetFullName() or "nil"
                 return details .. " | modelo=" .. model:GetFullName() .. " | parte=" .. part:GetFullName()
                     .. " | pos=" .. tostring(part.Position) .. " | HP=" .. tostring(stats.Health)
                     .. " | vidaConhecida=" .. tostring(stats.LifeKnown) .. " | percurso=" .. tostring(reason)
+                    .. " | selecao=" .. tostring(eligibility) .. " | obstaculo=" .. blockerName
             end)
             table.insert(report, ok and line or ("@" .. other.Name .. " | erro=" .. tostring(line)))
         end
     end
+    local characters = Workspace:FindFirstChild("Characters")
+    local unmapped = 0
+    if characters then
+        for _, model in ipairs(characters:GetChildren()) do
+            if not mapped[model] and worldCharacter(model) and findBodyPart(model) then
+                unmapped = unmapped + 1
+                if unmapped <= 20 then table.insert(report, "Modelo sem Player: " .. model:GetFullName()) end
+            end
+        end
+    end
+    table.insert(report, "Modelos sem Player=" .. unmapped .. " (podem incluir NPCs; nao sao alvos nesta versao)")
     local text = table.concat(report, "\n")
     print(text)
     local copied = type(setclipboard) == "function" and pcall(setclipboard, text)
@@ -1071,6 +1156,7 @@ connect(diagnosticButton.Activated, function()
 end)
 
 connect(Players.PlayerRemoving, function(other)
+    espMemory[other] = nil
     removeESP(other)
     if target == other then
         target = nil
@@ -1093,8 +1179,12 @@ local function updateAim(camera, size, dt, input)
             target = chooseTarget(camera)
         end
         if target then
-            local character, _, head = getEnemy(target)
-            if character and targetScore(camera, target) ~= nil then
+            local character, head
+            if safeTargetScore(camera, target) ~= nil then
+                local stats
+                character, stats, head = getEnemy(target)
+            end
+            if character then
                 local origin = camera.CFrame.Position
                 if (head.Position - origin).Magnitude > 0.01 then
                     if input == "Mouse" then
@@ -1150,7 +1240,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         target = nil
         inputNotice = "Falha na mira. Copie o diagnostico."
         inputNoticeUntil = os.clock() + 10
-        warn("VANTA Mira v0.5: " .. tostring(aimError))
+        warn("VANTA Mira v0.6: " .. tostring(aimError))
         refreshUI()
     end
 
@@ -1160,7 +1250,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         clearESP()
         espNotice = "Falha no ESP. Veja a mensagem no console."
         espNoticeUntil = os.clock() + 10
-        warn("VANTA ESP v0.5: " .. tostring(espError))
+        warn("VANTA ESP v0.6: " .. tostring(espError))
         refreshUI()
     end
 
@@ -1176,7 +1266,8 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         else
             local targetText = target and ("Alvo: @" .. target.Name) or "Alvo: nenhum"
             local espText = Config.ESP and ("ESP: " .. espCounters.drawn .. "/" .. espCounters.compatible
-                .. " | Equipe ?: " .. espCounters.unknown) or "ESP: OFF"
+                .. " | Equipe ?: " .. espCounters.unknown .. "\nOcultos PVS: " .. espCounters.culled
+                .. " | Ultimas posicoes: " .. espCounters.lastKnown) or "ESP: OFF"
             status.Text = targetText .. "\n" .. rosterStatus() .. "\n" .. espText
             if kickGuard.enabled then
                 status.Text = status.Text .. "\nKick local bloqueado: " .. kickGuard.blocked
@@ -1189,4 +1280,4 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
     frameData = nil
 end)
 
-print("VANTA BloxStrike v0.5 TESTE carregado. Alcance ESP ajustavel: 250 a 10000 studs. X encerra.")
+print("VANTA BloxStrike v0.6 TESTE carregado. Cinza: ultima posicao por ate 3s; nunca usada pela mira. X encerra.")
