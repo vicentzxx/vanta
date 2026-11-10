@@ -1,4 +1,4 @@
--- VANTA BloxStrike v0.3 TESTE | Luau / Roblox client
+-- VANTA BloxStrike v0.4 TESTE | Luau / Roblox client
 -- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Adaptacao experimental; ainda sem teste real no BloxStrike/executores.
 -- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
@@ -159,6 +159,7 @@ local espNotice = nil
 local espNoticeUntil = 0
 local espCounters = { compatible = 0, drawn = 0, unknown = 0 }
 local resolveCharacter
+local frameData -- Somente referencias/atributos do quadro atual; nunca conserva posicoes antigas.
 
 -- BEGIN BLOXSTRIKE_HELPERS
 local TEAM_ALIASES = {
@@ -190,31 +191,48 @@ end
 
 local function readAttribute(object, name)
     if not object or type(object.GetAttribute) ~= "function" then return nil end
+    if frameData and type(object.GetAttributes) == "function" then
+        local attributes = frameData.attributes[object]
+        if not attributes then
+            local ok, values = pcall(object.GetAttributes, object)
+            if ok and type(values) == "table" then
+                attributes = values
+                frameData.attributes[object] = attributes
+            end
+        end
+        if attributes then return attributes[name] end
+    end
     local ok, value = pcall(object.GetAttribute, object, name)
     if ok then return value end
     return nil
 end
 
 local function readPlayerTeam(other)
+    local cached = frameData and frameData.teams[other]
+    if cached then return cached[1], cached[2] end
+    local function result(side, source)
+        if frameData then frameData.teams[other] = { side, source } end
+        return side, source
+    end
     local fallback, source, inactive = nil, nil, false
     local character = other.Character
-    if not character and type(resolveCharacter) == "function" then character = resolveCharacter(other) end
+    if type(resolveCharacter) == "function" then character = resolveCharacter(other) or character end
     for _, entry in ipairs({ { other, "Player" }, { character, "Character" } }) do
         for _, key in ipairs({ "Team", "TeamName", "Side", "Faction", "team", "teamName", "side", "faction" }) do
             local side, kind = normalizeTeam(readAttribute(entry[1], key))
-            if side == "ct" or side == "t" then return side, entry[2] .. "." .. key end
+            if side == "ct" or side == "t" then return result(side, entry[2] .. "." .. key) end
             if kind == "inactive" then inactive = true end
             if side and fallback == nil then fallback, source = side, entry[2] .. "." .. key end
         end
     end
     if other.Team ~= nil and not other.Neutral then
         local side, kind = normalizeTeam(other.Team.Name)
-        if side == "ct" or side == "t" then return side, "Player.Team" end
+        if side == "ct" or side == "t" then return result(side, "Player.Team") end
         if kind == "inactive" then inactive = true end
         if side and fallback == nil then fallback, source = side, "Player.Team" end
     end
-    if inactive then return nil, "inactive" end
-    return fallback, source or "desconhecida"
+    if inactive then return result(nil, "inactive") end
+    return result(fallback, source or "desconhecida")
 end
 
 local function teamColorKey(other)
@@ -417,7 +435,7 @@ local dragHandle = make("TextLabel", {
     Size = UDim2.fromOffset(154, 40),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "VANTA | BLOX v0.3",
+    Text = "VANTA | BLOX v0.4",
     TextColor3 = Color3.fromRGB(240, 240, 248),
     Font = Enum.Font.GothamBold,
     TextSize = 13,
@@ -448,7 +466,7 @@ local close = button(panel, "X", UDim2.fromOffset(28, 28), UDim2.fromOffset(202,
 local body = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 44),
     Size = UDim2.fromOffset(216, panelHeight - 54),
-    CanvasSize = UDim2.fromOffset(0, 440),
+    CanvasSize = UDim2.fromOffset(0, 480),
     ScrollBarThickness = 3,
     ScrollingDirection = Enum.ScrollingDirection.Y,
     BorderSizePixel = 0,
@@ -496,8 +514,9 @@ local status = make("TextLabel", {
     TextColor3 = Color3.fromRGB(211, 211, 228),
     ZIndex = 3,
 }, body)
+local diagnosticButton = button(body, "Copiar diagnostico", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 400))
 make("TextLabel", {
-    Position = UDim2.fromOffset(0, 400),
+    Position = UDim2.fromOffset(0, 440),
     Size = UDim2.fromOffset(216, 34),
     BackgroundTransparency = 1,
     Text = "Versao de teste. Arraste o titulo.\nAnti-Kick local nao impede banimento.",
@@ -661,42 +680,72 @@ local function finiteHealth(value)
     return number
 end
 
+local function worldCharacter(character)
+    return character ~= nil and character.Parent ~= nil
+        and type(character.IsDescendantOf) == "function" and character:IsDescendantOf(Workspace)
+end
+
+local function bodyPartBelongs(part, character)
+    if not part or not part.Parent or not part:IsA("BasePart") or not part:IsDescendantOf(character) then
+        return false
+    end
+    return not part:FindFirstAncestorOfClass("Tool") and not part:FindFirstAncestorOfClass("Accessory")
+end
+
+local function namedBodyPart(character, name)
+    local parts = frameData and frameData.parts[character]
+    if parts and parts[name] ~= nil then
+        local part = parts[name]
+        return part ~= false and bodyPartBelongs(part, character) and part or nil
+    end
+    local part = character:FindFirstChild(name)
+    if not bodyPartBelongs(part, character) then part = character:FindFirstChild(name, true) end
+    if not bodyPartBelongs(part, character) then part = nil end
+    if frameData then
+        parts = parts or {}
+        parts[name] = part or false
+        frameData.parts[character] = parts
+    end
+    return part
+end
+
 local function findBodyPart(character)
     for _, name in ipairs({ "Head", "HeadHB", "UpperTorso", "Torso", "HumanoidRootPart" }) do
-        local part = character:FindFirstChild(name)
-        if part and part:IsA("BasePart") then return part end
-    end
-    -- Alguns personagens mantem suas partes dentro de um submodelo.
-    for _, name in ipairs({ "Head", "HeadHB", "UpperTorso", "Torso", "HumanoidRootPart" }) do
-        local part = character:FindFirstChild(name, true)
-        if part and part:IsA("BasePart") then
-            local tool = type(part.FindFirstAncestorOfClass) == "function" and part:FindFirstAncestorOfClass("Tool")
-            local accessory = type(part.FindFirstAncestorOfClass) == "function" and part:FindFirstAncestorOfClass("Accessory")
-            if not tool and not accessory then return part end
-        end
+        local part = namedBodyPart(character, name)
+        if part then return part end
     end
     return nil
 end
 
-resolveCharacter = function(other)
+local function resolveWorldCharacter(other)
     local character = other.Character
-    if character and character.Parent and findBodyPart(character) then return character end
+    if worldCharacter(character) and findBodyPart(character) then return character end
     if type(Workspace.FindFirstChild) == "function" then
         for _, folderName in ipairs({ "Characters", "Players", "PlayerCharacters" }) do
             local folder = Workspace:FindFirstChild(folderName)
             if folder then
                 local model = folder:FindFirstChild(other.Name)
                     or (other.UserId and folder:FindFirstChild(tostring(other.UserId)))
-                if model and model.Parent and findBodyPart(model) then return model end
+                if worldCharacter(model) and findBodyPart(model) then return model end
             end
         end
         local model = other.Name and Workspace:FindFirstChild(other.Name)
-        if model and model.Parent and findBodyPart(model) then return model end
+        if worldCharacter(model) and findBodyPart(model) then return model end
     end
-    return character and character.Parent and character or nil
+    return worldCharacter(character) and character or nil
+end
+
+resolveCharacter = function(other)
+    local cached = frameData and frameData.models[other]
+    if cached ~= nil then return cached ~= false and cached or nil end
+    local character = resolveWorldCharacter(other)
+    if frameData then frameData.models[other] = character or false end
+    return character
 end
 
 local function lifeData(character, owner)
+    local cached = frameData and frameData.lives[owner or character]
+    if cached and cached.character == character then return cached.stats, cached.dead end
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if not humanoid and character and type(character.FindFirstChildWhichIsA) == "function" then
         humanoid = character:FindFirstChildWhichIsA("Humanoid", true)
@@ -712,8 +761,12 @@ local function lifeData(character, owner)
         or finiteHealth(readAttribute(owner, "MaxHealth"))
         or (humanoid and finiteHealth(humanoid.MaxHealth))
     local hipHeight = humanoid and finiteHealth(humanoid.HipHeight) or 2
-    return { Health = health, MaxHealth = maxHealth, HipHeight = hipHeight or 2,
-        humanoid = humanoid, LifeKnown = attributeHealth or health ~= nil or alive ~= nil }, dead
+    local stats = { Health = health, MaxHealth = maxHealth, HipHeight = hipHeight or 2,
+        humanoid = humanoid, LifeKnown = attributeHealth or health ~= nil or alive ~= nil }
+    if frameData and (owner or character) then
+        frameData.lives[owner or character] = { character = character, stats = stats, dead = dead }
+    end
+    return stats, dead
 end
 
 local function characterParts(other)
@@ -735,6 +788,7 @@ local function localAlive(owner)
 end
 -- END CHARACTER_RESOLVER
 
+-- BEGIN PLAYER_OBSERVATION
 local function getEnemy(other)
     if other == player or other.Parent ~= Players then
         return nil
@@ -761,31 +815,88 @@ end
 
 local function getESPCharacter(other)
     if other == player or other.Parent ~= Players then return nil end
-    local character, humanoid, part = characterParts(other)
-    if not character then return nil end
     local enemy = teamRelation(player, other, Config.MyTeam)
     local relation = espRelation(enemy)
     if not relation then return nil, nil, nil, enemy == nil and "unknown" or "ally" end
+    local character, humanoid, part = characterParts(other)
+    if not character then return nil end
     return character, humanoid, part, relation
 end
+-- END PLAYER_OBSERVATION
 
+-- BEGIN VISIBILITY_CHECK
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
-local function visible(camera, character, head)
-    if not Config.WallCheck then
-        return true
+local function lineOfSight(camera, character, part)
+    if not worldCharacter(character) or not bodyPartBelongs(part, character) then return false, "corpo invalido" end
+    local origin, position = camera.CFrame.Position, part.Position
+    local cached = frameData and frameData.visibility[part]
+    if cached and cached.origin == origin and cached.position == position and cached.character == character then
+        return cached.clear, cached.reason
     end
-    local ignore = { camera }
-    if player.Character then
-        table.insert(ignore, player.Character)
+    local function result(clear, reason)
+        if frameData then
+            frameData.visibility[part] = { origin = origin, position = position, character = character,
+                clear = clear, reason = reason }
+        end
+        return clear, reason
     end
+    -- Ignorar o proprio alvo permite testar o percurso inteiro ate sua posicao,
+    -- sem aceitar um hitbox externo que intercepte o raio antes de uma parede.
+    local ignore = { camera, character }
+    local localCharacter = resolveCharacter(player)
+    if localCharacter then table.insert(ignore, localCharacter) end
     rayParams.FilterDescendantsInstances = ignore
-    local origin = camera.CFrame.Position
-    local hit = Workspace:Raycast(origin, head.Position - origin, rayParams)
-    return hit == nil or hit.Instance:IsDescendantOf(character)
+    local rayOK, hit = pcall(Workspace.Raycast, Workspace, origin, position - origin, rayParams)
+    if not rayOK then return result(false, "consulta falhou") end
+    if hit ~= nil then return result(false, "parede/obstaculo") end
+
+    -- Consulta complementar da camera; continua sem bloquear o desenho do ESP.
+    local cameraOK, blockers = pcall(camera.GetPartsObscuringTarget, camera, { position }, ignore)
+    if not cameraOK then return result(false, "consulta da camera falhou") end
+    for _, blocker in ipairs(blockers) do
+        if blocker.Transparency < 1 and blocker.LocalTransparencyModifier < 1 then
+            return result(false, "parede/obstaculo")
+        end
+    end
+    return result(true, "livre")
 end
+
+local function visible(camera, character, part)
+    if not Config.WallCheck then return true end
+    return lineOfSight(camera, character, part)
+end
+-- END VISIBILITY_CHECK
+
+-- BEGIN ESP_WORLD_BOUNDS
+local function espWorldBounds(character, stats, anchor)
+    -- Caixa e mira usam a mesma ancora. A raiz/pes so ajustam a altura se
+    -- pertencerem ao mesmo corpo e estiverem proximos dessa ancora.
+    local position = anchor.Position
+    local isHead = anchor.Name == "Head" or anchor.Name == "HeadHB"
+    local topY = position.Y + anchor.Size.Y * 0.5 + (isHead and 0.2 or 2)
+    local bottomY = position.Y - (isHead and 4.5 or 3)
+    local root = namedBodyPart(character, "HumanoidRootPart")
+    if root and (root.Position - position).Magnitude <= 12 then
+        local candidate = root.Position.Y - root.Size.Y * 0.5 - math.max(stats.HipHeight, 1.5)
+        if candidate < topY and topY - candidate <= 14 then bottomY = candidate end
+    end
+    local footFound = false
+    for _, name in ipairs({ "LeftFoot", "RightFoot", "Left Leg", "Right Leg" }) do
+        local foot = namedBodyPart(character, name)
+        if foot and (foot.Position - position).Magnitude <= 12 then
+            local footY = foot.Position.Y - foot.Size.Y * 0.5
+            if footY < topY and topY - footY <= 14 then
+                bottomY = footFound and math.min(bottomY, footY) or footY
+                footFound = true
+            end
+        end
+    end
+    return Vector3.new(position.X, topY, position.Z), Vector3.new(position.X, bottomY, position.Z)
+end
+-- END ESP_WORLD_BOUNDS
 
 -- BEGIN TARGET_SELECTOR
 local function targetScore(camera, other)
@@ -817,87 +928,120 @@ local function chooseTarget(camera)
 end
 -- END TARGET_SELECTOR
 
+-- BEGIN ESP_RENDERER
+local function updateESPItem(camera, other)
+    local view = camera.ViewportSize
+    local character, humanoid, head, relation = getESPCharacter(other)
+    if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
+    local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
+    if not character or distance > Config.MaxDistance then
+        removeESP(other)
+    else
+        espCounters.compatible = espCounters.compatible + 1
+        local item = espItems[other]
+        if item and item.character ~= character then
+            removeESP(other)
+            item = nil
+        end
+        if not item then
+            local box = make("Frame", {
+                Name = "PlayerBox",
+                BackgroundTransparency = 1,
+                BorderSizePixel = 0,
+                Visible = false,
+                ZIndex = 1,
+            }, espLayer)
+            local outline = make("UIStroke", { Thickness = 1.5, Color = accent }, box)
+            local label = make("TextLabel", {
+                AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 0, -34),
+                Size = UDim2.fromOffset(200, 32),
+                BackgroundTransparency = 1,
+                TextColor3 = Color3.fromRGB(255, 240, 245),
+                TextStrokeTransparency = 0.1,
+                Font = Enum.Font.GothamBold,
+                TextSize = 12,
+                TextWrapped = true,
+                ZIndex = 1,
+            }, box)
+            item = { character = character, box = box, label = label, outline = outline }
+            espItems[other] = item
+        end
+
+        local topPosition, bottomPosition = espWorldBounds(character, humanoid, head)
+        local top = camera:WorldToViewportPoint(topPosition)
+        local bottom = camera:WorldToViewportPoint(bottomPosition)
+        local x, y, width, height = screenBox(top.X, top.Y, top.Z, bottom.X, bottom.Y, bottom.Z, view.X, view.Y)
+        item.box.Visible = x ~= nil
+        if x ~= nil then
+            item.box.Position = UDim2.fromOffset(x, y)
+            item.box.Size = UDim2.fromOffset(width, height)
+            espCounters.drawn = espCounters.drawn + 1
+            local clear, reason = lineOfSight(camera, character, head)
+            local blocked = reason == "parede/obstaculo"
+            local color = clear and Color3.fromRGB(255, 85, 110) or Color3.fromRGB(255, 190, 80)
+            item.outline.Color = color
+            item.label.TextColor3 = color
+            local suffix = blocked and " [parede]" or (not clear and " [?]" or "")
+            item.label.Text = "@" .. other.Name .. suffix
+        end
+    end
+end
+
+local function hideESP()
+    for _, item in pairs(espItems) do item.box.Visible = false end
+end
+
 local function updateESP(camera)
     espCounters.compatible, espCounters.drawn, espCounters.unknown = 0, 0, 0
+    hideESP()
     if not Config.ESP then return end
-    local now = os.clock()
-    local view = camera.ViewportSize
     for _, other in ipairs(Players:GetPlayers()) do
-        local character, humanoid, head, relation = getESPCharacter(other)
-        if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
-        local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
-        if not character or distance > Config.MaxDistance then
+        local ok, reason = pcall(updateESPItem, camera, other)
+        if not ok then
             removeESP(other)
-        else
-            espCounters.compatible = espCounters.compatible + 1
-            local item = espItems[other]
-            if item and item.character ~= character then
-                removeESP(other)
-                item = nil
-            end
-            if not item then
-                local box = make("Frame", {
-                    Name = "PlayerBox",
-                    BackgroundTransparency = 1,
-                    BorderSizePixel = 0,
-                    Visible = false,
-                    ZIndex = 1,
-                }, espLayer)
-                local outline = make("UIStroke", { Thickness = 1.5, Color = accent }, box)
-                local label = make("TextLabel", {
-                    AnchorPoint = Vector2.new(0.5, 0),
-                    Position = UDim2.new(0.5, 0, 0, -34),
-                    Size = UDim2.fromOffset(200, 32),
-                    BackgroundTransparency = 1,
-                    TextColor3 = Color3.fromRGB(255, 240, 245),
-                    TextStrokeTransparency = 0.1,
-                    Font = Enum.Font.GothamBold,
-                    TextSize = 12,
-                    TextWrapped = true,
-                    ZIndex = 1,
-                }, box)
-                item = { character = character, box = box, label = label, outline = outline,
-                    lastLabelTime = -math.huge }
-                espItems[other] = item
-            end
-
-            local root = character:FindFirstChild("HumanoidRootPart")
-            if not root or not root:IsA("BasePart") then root = head end
-            local actualHead = character:FindFirstChild("Head")
-            if not actualHead or not actualHead:IsA("BasePart") then actualHead = nil end
-            local topPosition = actualHead and (actualHead.Position + Vector3.new(0, actualHead.Size.Y * 0.5 + 0.2, 0))
-                or (root.Position + Vector3.new(0, root.Size.Y * 0.5 + 2, 0))
-            local bottomY = root.Position.Y - root.Size.Y * 0.5 - math.max(humanoid.HipHeight, 1.5)
-            local footFound = false
-            for _, name in ipairs({ "LeftFoot", "RightFoot", "Left Leg", "Right Leg" }) do
-                local foot = character:FindFirstChild(name)
-                if foot and foot:IsA("BasePart") then
-                    local footY = foot.Position.Y - foot.Size.Y * 0.5
-                    bottomY = footFound and math.min(bottomY, footY) or footY
-                    footFound = true
-                end
-            end
-            local bottomPosition = Vector3.new(root.Position.X, bottomY, root.Position.Z)
-            local top = camera:WorldToViewportPoint(topPosition)
-            local bottom = camera:WorldToViewportPoint(bottomPosition)
-            local x, y, width, height = screenBox(top.X, top.Y, top.Z, bottom.X, bottom.Y, bottom.Z, view.X, view.Y)
-            item.box.Visible = x ~= nil
-            if x ~= nil then
-                item.box.Position = UDim2.fromOffset(x, y)
-                item.box.Size = UDim2.fromOffset(width, height)
-                espCounters.drawn = espCounters.drawn + 1
-                local color = Color3.fromRGB(255, 85, 110)
-                item.outline.Color = color
-                item.label.TextColor3 = color
-                if now - item.lastLabelTime >= Config.ESPInterval or item.relation ~= relation then
-                    item.label.Text = "@" .. other.Name
-                    item.lastLabelTime = now
-                    item.relation = relation
-                end
+            if not espNotice or os.clock() >= espNoticeUntil then
+                espNotice = "Um corpo falhou. Copie o diagnostico."
+                espNoticeUntil = os.clock() + 6
+                warn("VANTA ESP v0.4: @" .. other.Name .. ": " .. tostring(reason))
             end
         end
     end
 end
+-- END ESP_RENDERER
+
+connect(diagnosticButton.Activated, function()
+    -- Leitura pontual nova; o relatorio fica local ate o usuario decidir envia-lo.
+    frameData = nil
+    local camera = Workspace.CurrentCamera
+    local report = { "VANTA BloxStrike v0.4", "StreamingEnabled=" .. tostring(Workspace.StreamingEnabled),
+        "WallCheck=" .. tostring(Config.WallCheck) .. " | MinhaEquipe=" .. Config.MyTeam }
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player then
+            local ok, line = pcall(function()
+                local model, stats, part, state = characterParts(other)
+                local side = readPlayerTeam(other)
+                local original = other.Character and other.Character:GetFullName() or "nil"
+                local details = "@" .. other.Name .. " | equipe=" .. tostring(side) .. " | Character=" .. original
+                if not model then return details .. " | " .. tostring(state) end
+                local reason = "sem camera"
+                if camera then
+                    local clear
+                    clear, reason = lineOfSight(camera, model, part)
+                end
+                return details .. " | modelo=" .. model:GetFullName() .. " | parte=" .. part:GetFullName()
+                    .. " | pos=" .. tostring(part.Position) .. " | HP=" .. tostring(stats.Health)
+                    .. " | vidaConhecida=" .. tostring(stats.LifeKnown) .. " | percurso=" .. tostring(reason)
+            end)
+            table.insert(report, ok and line or ("@" .. other.Name .. " | erro=" .. tostring(line)))
+        end
+    end
+    local text = table.concat(report, "\n")
+    print(text)
+    local copied = type(setclipboard) == "function" and pcall(setclipboard, text)
+    inputNotice = copied and "Diagnostico copiado. Cole no chat." or "Diagnostico no console (F9)."
+    inputNoticeUntil = os.clock() + 7
+end)
 
 connect(Players.PlayerRemoving, function(other)
     removeESP(other)
@@ -910,20 +1054,7 @@ connect(player.CharacterAdded, function()
     scanElapsed = Config.ScanInterval
 end)
 
-RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, function(dt)
-    if not active then
-        return
-    end
-    local camera = Workspace.CurrentCamera
-    if not camera then
-        return
-    end
-    local size = camera.ViewportSize
-    ring.Position = UDim2.fromOffset(size.X * 0.5, size.Y * 0.5)
-
-    scanElapsed = scanElapsed + dt
-    espElapsed = espElapsed + dt
-    local input = aimInput()
+local function updateAim(camera, size, dt, input)
     local canAim = UserInputService:GetFocusedTextBox() == nil and not dragging
     if input == "Mouse" and (not mouseAvailable()
         or UserInputService.MouseBehavior == Enum.MouseBehavior.Default) then
@@ -971,6 +1102,30 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
     else
         target = nil
     end
+end
+
+RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, function(dt)
+    if not active then return end
+    -- A UI antiga fica escondida ate ser redesenhada com observacoes deste quadro.
+    -- Assim ausencia de camera/corpo nao conserva uma caixa na ultima posicao.
+    hideESP()
+    local camera = Workspace.CurrentCamera
+    if not camera then target = nil; frameData = nil; return end
+    frameData = { attributes = {}, teams = {}, models = {}, parts = {}, lives = {}, visibility = {} }
+    local size = camera.ViewportSize
+    ring.Position = UDim2.fromOffset(size.X * 0.5, size.Y * 0.5)
+    scanElapsed = scanElapsed + dt
+    espElapsed = espElapsed + dt
+    local input = aimInput()
+    local aimOK, aimError = pcall(updateAim, camera, size, dt, input)
+    if not aimOK then
+        Config.Aim = false
+        target = nil
+        inputNotice = "Falha na mira. Copie o diagnostico."
+        inputNoticeUntil = os.clock() + 10
+        warn("VANTA Mira v0.4: " .. tostring(aimError))
+        refreshUI()
+    end
 
     local espOK, espError = pcall(updateESP, camera)
     if not espOK then
@@ -978,7 +1133,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         clearESP()
         espNotice = "Falha no ESP. Veja a mensagem no console."
         espNoticeUntil = os.clock() + 10
-        warn("VANTA ESP v0.3: " .. tostring(espError))
+        warn("VANTA ESP v0.4: " .. tostring(espError))
         refreshUI()
     end
 
@@ -1004,6 +1159,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
             teamButton.Text = "Minha equipe: " .. (side and string.upper(side) or "Auto (?)")
         end
     end
+    frameData = nil
 end)
 
-print("VANTA BloxStrike v0.3 TESTE carregado. Somente adversarios; Camera por padrao. X encerra.")
+print("VANTA BloxStrike v0.4 TESTE carregado. Vermelho: percurso livre; amarelo: parede/consulta incerta. X encerra.")
