@@ -1,4 +1,4 @@
--- VANTA BloxStrike v0.4 TESTE | Luau / Roblox client
+-- VANTA BloxStrike v0.5 TESTE | Luau / Roblox client
 -- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Adaptacao experimental; ainda sem teste real no BloxStrike/executores.
 -- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
@@ -24,7 +24,8 @@ local Config = {
     WallCheck = true,
     MyTeam = "Auto",     -- Auto | CT | T. Os dois recursos selecionam apenas adversarios conhecidos.
     FOV = 150,           -- Raio em pixels, a partir do centro da tela.
-    MaxDistance = 2500,  -- Distancia em studs.
+    MaxDistance = 2500,  -- Alcance da mira em studs.
+    ESPMaxDistance = 2500, -- Alcance independente do ESP; ajustavel no painel.
     AimStrength = 100,   -- 20 a 100. Em Camera, 100 centraliza diretamente no alvo.
     AimInput = "Camera", -- Camera por padrao; evita assumir semantica de mousemoverel no Xeno.
     ScanInterval = 0.03,
@@ -435,7 +436,7 @@ local dragHandle = make("TextLabel", {
     Size = UDim2.fromOffset(154, 40),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "VANTA | BLOX v0.4",
+    Text = "VANTA | BLOX v0.5",
     TextColor3 = Color3.fromRGB(240, 240, 248),
     Font = Enum.Font.GothamBold,
     TextSize = 13,
@@ -466,7 +467,7 @@ local close = button(panel, "X", UDim2.fromOffset(28, 28), UDim2.fromOffset(202,
 local body = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 44),
     Size = UDim2.fromOffset(216, panelHeight - 54),
-    CanvasSize = UDim2.fromOffset(0, 480),
+    CanvasSize = UDim2.fromOffset(0, 520),
     ScrollBarThickness = 3,
     ScrollingDirection = Enum.ScrollingDirection.Y,
     BorderSizePixel = 0,
@@ -503,8 +504,20 @@ local strengthLabel = make("TextLabel", {
     TextColor3 = Color3.fromRGB(235, 235, 245),
     ZIndex = 3,
 }, body)
+local espDistanceLess = button(body, "-", UDim2.fromOffset(38, 32), UDim2.fromOffset(0, 320))
+local espDistanceMore = button(body, "+", UDim2.fromOffset(38, 32), UDim2.fromOffset(178, 320))
+local espDistanceLabel = make("TextLabel", {
+    Position = UDim2.fromOffset(42, 320),
+    Size = UDim2.fromOffset(132, 32),
+    BackgroundTransparency = 1,
+    Text = "ESP: " .. Config.ESPMaxDistance .. " studs",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    ZIndex = 3,
+}, body)
 local status = make("TextLabel", {
-    Position = UDim2.fromOffset(0, 318),
+    Position = UDim2.fromOffset(0, 358),
     Size = UDim2.fromOffset(216, 78),
     BackgroundTransparency = 1,
     Text = "Alvo: nenhum",
@@ -514,9 +527,9 @@ local status = make("TextLabel", {
     TextColor3 = Color3.fromRGB(211, 211, 228),
     ZIndex = 3,
 }, body)
-local diagnosticButton = button(body, "Copiar diagnostico", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 400))
+local diagnosticButton = button(body, "Copiar diagnostico", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 440))
 make("TextLabel", {
-    Position = UDim2.fromOffset(0, 440),
+    Position = UDim2.fromOffset(0, 480),
     Size = UDim2.fromOffset(216, 34),
     BackgroundTransparency = 1,
     Text = "Versao de teste. Arraste o titulo.\nAnti-Kick local nao impede banimento.",
@@ -545,6 +558,11 @@ local function refreshUI()
     inputButton.Text = "Entrada: " .. Config.AimInput .. " (" .. aimInput() .. ")"
     fovLabel.Text = "FOV: " .. Config.FOV
     strengthLabel.Text = "Forca: " .. Config.AimStrength .. "%"
+    espDistanceLabel.Text = "ESP: " .. Config.ESPMaxDistance .. " studs"
+    espDistanceLess.Active = Config.ESPMaxDistance > 250
+    espDistanceMore.Active = Config.ESPMaxDistance < 10000
+    espDistanceLess.TextTransparency = Config.ESPMaxDistance <= 250 and 0.6 or 0
+    espDistanceMore.TextTransparency = Config.ESPMaxDistance >= 10000 and 0.6 or 0
     ring.Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
     ring.Visible = Config.Aim
 end
@@ -623,6 +641,14 @@ connect(strengthLess.Activated, function()
 end)
 connect(strengthMore.Activated, function()
     Config.AimStrength = math.clamp(Config.AimStrength + 5, 20, 100)
+    refreshUI()
+end)
+connect(espDistanceLess.Activated, function()
+    Config.ESPMaxDistance = math.clamp(Config.ESPMaxDistance - 250, 250, 10000)
+    refreshUI()
+end)
+connect(espDistanceMore.Activated, function()
+    Config.ESPMaxDistance = math.clamp(Config.ESPMaxDistance + 250, 250, 10000)
     refreshUI()
 end)
 local collapsed = false
@@ -934,7 +960,7 @@ local function updateESPItem(camera, other)
     local character, humanoid, head, relation = getESPCharacter(other)
     if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
     local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
-    if not character or distance > Config.MaxDistance then
+    if not character or distance > Config.ESPMaxDistance then
         removeESP(other)
     else
         espCounters.compatible = espCounters.compatible + 1
@@ -1003,7 +1029,7 @@ local function updateESP(camera)
             if not espNotice or os.clock() >= espNoticeUntil then
                 espNotice = "Um corpo falhou. Copie o diagnostico."
                 espNoticeUntil = os.clock() + 6
-                warn("VANTA ESP v0.4: @" .. other.Name .. ": " .. tostring(reason))
+                warn("VANTA ESP v0.5: @" .. other.Name .. ": " .. tostring(reason))
             end
         end
     end
@@ -1014,8 +1040,9 @@ connect(diagnosticButton.Activated, function()
     -- Leitura pontual nova; o relatorio fica local ate o usuario decidir envia-lo.
     frameData = nil
     local camera = Workspace.CurrentCamera
-    local report = { "VANTA BloxStrike v0.4", "StreamingEnabled=" .. tostring(Workspace.StreamingEnabled),
-        "WallCheck=" .. tostring(Config.WallCheck) .. " | MinhaEquipe=" .. Config.MyTeam }
+    local report = { "VANTA BloxStrike v0.5", "StreamingEnabled=" .. tostring(Workspace.StreamingEnabled),
+        "WallCheck=" .. tostring(Config.WallCheck) .. " | MinhaEquipe=" .. Config.MyTeam,
+        "AlcanceESP=" .. Config.ESPMaxDistance .. " | AlcanceMira=" .. Config.MaxDistance }
     for _, other in ipairs(Players:GetPlayers()) do
         if other ~= player then
             local ok, line = pcall(function()
@@ -1123,7 +1150,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         target = nil
         inputNotice = "Falha na mira. Copie o diagnostico."
         inputNoticeUntil = os.clock() + 10
-        warn("VANTA Mira v0.4: " .. tostring(aimError))
+        warn("VANTA Mira v0.5: " .. tostring(aimError))
         refreshUI()
     end
 
@@ -1133,7 +1160,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         clearESP()
         espNotice = "Falha no ESP. Veja a mensagem no console."
         espNoticeUntil = os.clock() + 10
-        warn("VANTA ESP v0.4: " .. tostring(espError))
+        warn("VANTA ESP v0.5: " .. tostring(espError))
         refreshUI()
     end
 
@@ -1162,4 +1189,4 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
     frameData = nil
 end)
 
-print("VANTA BloxStrike v0.4 TESTE carregado. Vermelho: percurso livre; amarelo: parede/consulta incerta. X encerra.")
+print("VANTA BloxStrike v0.5 TESTE carregado. Alcance ESP ajustavel: 250 a 10000 studs. X encerra.")

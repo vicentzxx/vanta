@@ -1,9 +1,10 @@
-# VANTA BloxStrike — teste 0.4
+# VANTA BloxStrike — teste 0.5
 
 Arquivo: `Vanta_BloxStrike_Teste.lua`. Esta adaptação aceita os places do universo `7633926880` da [experiência BloxStrike](https://www.roblox.com/games/114234929420007/BloxStrike).
 
 ## Correções desta versão
 
+- Novo controle **ESP: N studs**, abaixo da força da mira, com botões **− / +**. Ajusta de **250 a 10000 studs**, em passos de **250**, começando em **2500**. A mudança vale na atualização seguinte das caixas e não altera o alcance da mira. Se precisar, role o painel para alcançar o controle no celular.
 - Modelos fora do Workspace e partes removidas deixam de ser aceitos para mira e ESP. Ter apenas um Parent não confirma que o corpo continua no mundo ativo. A validação usa a hierarquia de [Instance](https://create.roblox.com/docs/reference/engine/classes/Instance#IsDescendantOf).
 - Caixa e mira usam a mesma referência do corpo. Uma raiz ou um pé distante dessa referência não desloca a caixa para outro ponto.
 - As caixas são escondidas antes de cada atualização e redesenhadas usando as posições atuais. Um corpo inválido não conserva a caixa no último lugar; uma falha individual também não interrompe os demais jogadores.
@@ -14,14 +15,15 @@ Arquivo: `Vanta_BloxStrike_Teste.lua`. Esta adaptação aceita os places do univ
 
 ## Como testar
 
-1. Execute o carregador abaixo e confirme o título **VANTA | BLOX v0.4**. A instância anterior do VANTA é encerrada durante a troca.
+1. Execute o carregador abaixo e confirme o título **VANTA | BLOX v0.5**. A instância anterior do VANTA é encerrada durante a troca.
 2. Ative **ESP inimigos** e mantenha **Checar paredes: ON**.
 3. Confira **Minha equipe**. Se Auto não identificar seu lado, selecione **CT** ou **T**. A escolha informa apenas o seu lado ao filtro; aliados, espectadores identificados e equipes desconhecidas continuam excluídos.
 4. Ative **Mira** com **Entrada: Camera**. A força começa em 100% e pode ser reduzida pelos botões. O modo Mouse depende do executor e exige o mouse travado pelo jogo.
 5. Observe um adversário andando, parando e passando atrás de uma parede. A caixa deve acompanhar o corpo disponível no cliente. Se o obstáculo for detectado, a caixa muda para amarelo e a mira deixa de selecionar aquele alvo enquanto a checagem estiver ligada.
-6. Se surgir uma caixa sem ninguém naquele ponto ou faltar a de um adversário, clique em **Copiar diagnostico durante a falha** e cole o relatório no chat. No PC, o console pode ser aberto com F9 se a cópia não estiver disponível.
+6. Para aumentar o alcance do ESP, use **+** ao lado de **ESP: N studs** e teste **5000** ou **10000**. O regulador altera apenas o filtro de distância; se o jogo não fornecer o corpo distante ao cliente, aumentar o número não cria essa informação.
+7. Se surgir uma caixa sem ninguém naquele ponto ou faltar a de um adversário mesmo dentro do alcance selecionado, clique em **Copiar diagnostico durante a falha** e cole o relatório no chat. O relatório inclui os alcances de ESP e mira. No PC, o console pode ser aberto com F9 se a cópia não estiver disponível.
 
-O ESP usa caixas 2D na região visível da tela e alcance máximo de 2500 studs. Não inclui setas para alvos atrás da câmera nem NPCs do modo Zombies. Mira, ESP e Anti-Kick local começam desligados. **X** encerra os recursos e remove a interface.
+O ESP usa caixas 2D na região visível da tela e o alcance escolhido no regulador. O alcance da mira continua em 2500 studs. Não inclui setas para alvos atrás da câmera nem NPCs do modo Zombies. Mira, ESP e Anti-Kick local começam desligados. O botão **X** encerra os recursos e remove a interface.
 
 ## Limites e validação
 
@@ -36,5 +38,5 @@ O Anti-Kick opcional filtra determinadas chamadas locais e não impede expulsõe
 ## Carregador
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/vicentzxx/vanta/main/Vanta_BloxStrike_Teste.lua?v=0.4"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/vicentzxx/vanta/main/Vanta_BloxStrike_Teste.lua?v=0.5"))()
 ```
