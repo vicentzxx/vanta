@@ -1,4 +1,4 @@
--- VANTA BloxStrike v0.1 TESTE | Luau / Roblox client
+-- VANTA BloxStrike v0.2 TESTE | Luau / Roblox client
 -- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Adaptacao experimental; ainda sem teste real no BloxStrike/executores.
 -- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
@@ -25,12 +25,9 @@ local Config = {
     TeamCheck = true,
     FOV = 150,           -- Raio em pixels, a partir do centro da tela.
     MaxDistance = 2500,  -- Distancia em studs.
-    AimSpeed = 14,       -- Quanto maior, mais rapida a mira.
+    AimStrength = 85,    -- 20 a 100. Em Camera, 100 centraliza diretamente no alvo.
     AimInput = "Auto",   -- Auto | Mouse | Camera. Auto prefere mouse em PCs sem toque.
-    MouseGain = 0.65,
-    MouseMaxStep = 18,   -- Limite por quadro a 60 FPS; nao e uma protecao anti-ban.
-    MouseDeadzone = 2,
-    ScanInterval = 0.05,
+    ScanInterval = 0.03,
     ESPInterval = 0.15,
 }
 
@@ -158,6 +155,9 @@ local kickNoticeUntil = 0
 local mouseMover = mousemoverel
 local inputNotice = nil
 local inputNoticeUntil = 0
+local espNotice = nil
+local espNoticeUntil = 0
+local espCounters = { compatible = 0, drawn = 0, unknown = 0 }
 
 -- BEGIN BLOXSTRIKE_HELPERS
 local function normalizeTeam(value)
@@ -206,6 +206,40 @@ local function computeMouseStep(dx, dy, dt, speed, gain, maxStep, deadzone)
     local scale = step / distance
     return dx * scale, dy * scale
 end
+
+local function strengthSettings(strength)
+    local value = math.max(20, math.min(100, strength))
+    return value, 8 + value * 0.35, 0.7 + value / 200, 18 + value * 0.42,
+        value >= 100 and 0.5 or 1
+end
+
+local function computeAimAlpha(dt, strength)
+    if dt ~= dt or dt <= 0 then return 0 end
+    local value, speed = strengthSettings(strength)
+    if value >= 100 then return 1 end
+    return 1 - math.exp(-speed * math.min(dt, 0.1))
+end
+
+local function espRelation(enemy, teamCheck)
+    if teamCheck and enemy == false then return nil end
+    if enemy == nil then return "unknown" end
+    return enemy and "enemy" or "ally"
+end
+
+-- Projecao 2D sem dependencia de Highlight, BillboardGui ou Drawing do executor.
+local function screenBox(tx, ty, tz, bx, by, bz, viewX, viewY)
+    for _, value in ipairs({ tx, ty, tz, bx, by, bz, viewX, viewY }) do
+        if value ~= value or math.abs(value) == math.huge then return nil end
+    end
+    if tz <= 0.05 or bz <= 0.05 or viewX <= 0 or viewY <= 0 then return nil end
+    local height = math.max(8, math.abs(by - ty))
+    if height > viewY * 4 then return nil end
+    local width = math.max(6, height * 0.45)
+    local x = (tx + bx) * 0.5 - width * 0.5
+    local y = math.min(ty, by)
+    if x + width < 0 or x > viewX or y + height < 0 or y > viewY then return nil end
+    return x, y, width, height
+end
 -- END BLOXSTRIKE_HELPERS
 
 local function mouseAvailable()
@@ -243,13 +277,18 @@ local gui = make("ScreenGui", {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, playerGui)
 local shutdownEvent = make("BindableEvent", { Name = "Shutdown" }, gui)
-local espFolder = make("Folder", { Name = FOLDER_NAME }, Workspace)
+local espLayer = make("Frame", {
+    Name = "ESP2D",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 1,
+}, gui)
 
 local function removeESP(other)
     local item = espItems[other]
     if item then
-        item.highlight:Destroy()
-        item.billboard:Destroy()
+        item.box:Destroy()
         espItems[other] = nil
     end
 end
@@ -262,6 +301,9 @@ local function clearESP()
     for _, other in ipairs(pending) do
         removeESP(other)
     end
+    espCounters.compatible = 0
+    espCounters.drawn = 0
+    espCounters.unknown = 0
 end
 
 local function shutdown()
@@ -276,7 +318,6 @@ local function shutdown()
         connection:Disconnect()
     end
     clearESP()
-    espFolder:Destroy()
     gui:Destroy()
 end
 connect(shutdownEvent.Event, shutdown)
@@ -285,7 +326,7 @@ connect(gui.Destroying, shutdown)
 local accent = Color3.fromRGB(124, 100, 255)
 local muted = Color3.fromRGB(60, 64, 82)
 local initialCamera = Workspace.CurrentCamera
-local panelHeight = math.clamp((initialCamera and initialCamera.ViewportSize.Y or 700) - 84, 260, 432)
+local panelHeight = math.clamp((initialCamera and initialCamera.ViewportSize.Y or 700) - 84, 220, 472)
 local ring = make("Frame", {
     Name = "FOV",
     AnchorPoint = Vector2.new(0.5, 0.5),
@@ -316,7 +357,7 @@ local dragHandle = make("TextLabel", {
     Size = UDim2.fromOffset(154, 40),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "VANTA | BLOXSTRIKE",
+    Text = "VANTA | BLOX v0.2",
     TextColor3 = Color3.fromRGB(240, 240, 248),
     Font = Enum.Font.GothamBold,
     TextSize = 13,
@@ -347,7 +388,7 @@ local close = button(panel, "X", UDim2.fromOffset(28, 28), UDim2.fromOffset(202,
 local body = make("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 44),
     Size = UDim2.fromOffset(216, panelHeight - 54),
-    CanvasSize = UDim2.fromOffset(0, 380),
+    CanvasSize = UDim2.fromOffset(0, 440),
     ScrollBarThickness = 3,
     ScrollingDirection = Enum.ScrollingDirection.Y,
     BorderSizePixel = 0,
@@ -372,9 +413,21 @@ local fovLabel = make("TextLabel", {
     TextColor3 = Color3.fromRGB(235, 235, 245),
     ZIndex = 3,
 }, body)
+local strengthLess = button(body, "-", UDim2.fromOffset(38, 32), UDim2.fromOffset(0, 280))
+local strengthMore = button(body, "+", UDim2.fromOffset(38, 32), UDim2.fromOffset(178, 280))
+local strengthLabel = make("TextLabel", {
+    Position = UDim2.fromOffset(42, 280),
+    Size = UDim2.fromOffset(132, 32),
+    BackgroundTransparency = 1,
+    Text = "Forca: " .. Config.AimStrength .. "%",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 13,
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    ZIndex = 3,
+}, body)
 local status = make("TextLabel", {
-    Position = UDim2.fromOffset(0, 278),
-    Size = UDim2.fromOffset(216, 60),
+    Position = UDim2.fromOffset(0, 318),
+    Size = UDim2.fromOffset(216, 78),
     BackgroundTransparency = 1,
     Text = "Alvo: nenhum",
     TextWrapped = true,
@@ -384,7 +437,7 @@ local status = make("TextLabel", {
     ZIndex = 3,
 }, body)
 make("TextLabel", {
-    Position = UDim2.fromOffset(0, 342),
+    Position = UDim2.fromOffset(0, 400),
     Size = UDim2.fromOffset(216, 34),
     BackgroundTransparency = 1,
     Text = "Versao de teste. Arraste o titulo.\nAnti-Kick local nao impede banimento.",
@@ -411,6 +464,7 @@ local function refreshUI()
     paintButton(teamButton, Config.TeamCheck, "Equipes")
     inputButton.Text = "Entrada: " .. Config.AimInput .. " (" .. aimInput() .. ")"
     fovLabel.Text = "FOV: " .. Config.FOV
+    strengthLabel.Text = "Forca: " .. Config.AimStrength .. "%"
     ring.Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
     ring.Visible = Config.Aim
 end
@@ -424,6 +478,7 @@ connect(aimButton.Activated, function()
 end)
 connect(espButton.Activated, function()
     Config.ESP = not Config.ESP
+    espNotice = nil
     if not Config.ESP then
         clearESP()
     end
@@ -478,6 +533,14 @@ connect(less.Activated, function()
 end)
 connect(more.Activated, function()
     Config.FOV = math.clamp(Config.FOV + 25, 50, 350)
+    refreshUI()
+end)
+connect(strengthLess.Activated, function()
+    Config.AimStrength = math.clamp(Config.AimStrength - 5, 20, 100)
+    refreshUI()
+end)
+connect(strengthMore.Activated, function()
+    Config.AimStrength = math.clamp(Config.AimStrength + 5, 20, 100)
     refreshUI()
 end)
 local collapsed = false
@@ -580,6 +643,16 @@ local function rosterStatus()
     return "Personagens detectados: " .. ready
 end
 
+local function getESPCharacter(other)
+    if other == player or other.Parent ~= Players then return nil end
+    local character, humanoid, part = characterParts(other)
+    if not character then return nil end
+    local enemy = teamRelation(player, other)
+    local relation = espRelation(enemy, Config.TeamCheck)
+    if not relation then return nil end
+    return character, humanoid, part, relation
+end
+
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
@@ -598,76 +671,134 @@ local function visible(camera, character, head)
     return hit == nil or hit.Instance:IsDescendantOf(character)
 end
 
-local function chooseTarget(camera)
+-- BEGIN TARGET_SELECTOR
+local function targetScore(camera, other)
+    local character, _, head = getEnemy(other)
+    if not character or (head.Position - camera.CFrame.Position).Magnitude > Config.MaxDistance then
+        return nil
+    end
     local center = camera.ViewportSize * 0.5
+    local screen, onScreen = camera:WorldToViewportPoint(head.Position)
+    if not onScreen or screen.Z <= 0 then return nil end
+    local score = (Vector2.new(screen.X, screen.Y) - center).Magnitude
+    if score > Config.FOV or not visible(camera, character, head) then return nil end
+    return score
+end
+
+local function chooseTarget(camera)
+    -- Mantem o alvo atual enquanto ele continuar elegivel, evitando trocas constantes.
+    if target and targetScore(camera, target) ~= nil then return target end
     local chosen = nil
     local best = Config.FOV
     for _, other in ipairs(Players:GetPlayers()) do
-        local character, _, head = getEnemy(other)
-        if character then
-            local distance = (head.Position - camera.CFrame.Position).Magnitude
-            if distance <= Config.MaxDistance then
-                local screen, onScreen = camera:WorldToViewportPoint(head.Position)
-                if onScreen and screen.Z > 0 then
-                    local score = (Vector2.new(screen.X, screen.Y) - center).Magnitude
-                    if score <= best and visible(camera, character, head) then
-                        best = score
-                        chosen = other
-                    end
-                end
-            end
+        local score = targetScore(camera, other)
+        if score and score <= best then
+            best = score
+            chosen = other
         end
     end
     return chosen
 end
+-- END TARGET_SELECTOR
 
 local function updateESP(camera)
-    if not Config.ESP then
-        return
-    end
+    espCounters.compatible, espCounters.drawn, espCounters.unknown = 0, 0, 0
+    if not Config.ESP then return end
+    local now = os.clock()
+    local view = camera.ViewportSize
     for _, other in ipairs(Players:GetPlayers()) do
-        local character, humanoid, head = getEnemy(other)
+        local character, humanoid, head, relation = getESPCharacter(other)
         local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
         if not character or distance > Config.MaxDistance then
             removeESP(other)
         else
+            espCounters.compatible = espCounters.compatible + 1
+            if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
             local item = espItems[other]
             if item and item.character ~= character then
                 removeESP(other)
                 item = nil
             end
             if not item then
-                local highlight = make("Highlight", {
-                    Adornee = character,
-                    DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-                    FillColor = Color3.fromRGB(255, 80, 110),
-                    FillTransparency = 0.72,
-                    OutlineColor = Color3.fromRGB(255, 230, 235),
-                    OutlineTransparency = 0,
-                }, espFolder)
-                local billboard = make("BillboardGui", {
-                    Name = "PlayerInfo",
-                    Adornee = head,
-                    Size = UDim2.fromOffset(180, 42),
-                    StudsOffsetWorldSpace = Vector3.new(0, 2.4, 0),
-                    AlwaysOnTop = true,
-                    MaxDistance = Config.MaxDistance,
-                }, espFolder)
+                local box = make("Frame", {
+                    Name = "PlayerBox",
+                    BackgroundTransparency = 1,
+                    BorderSizePixel = 0,
+                    Visible = false,
+                    ZIndex = 1,
+                }, espLayer)
+                local outline = make("UIStroke", { Thickness = 1.5, Color = accent }, box)
                 local label = make("TextLabel", {
-                    Size = UDim2.fromScale(1, 1),
+                    AnchorPoint = Vector2.new(0.5, 0),
+                    Position = UDim2.new(0.5, 0, 0, -34),
+                    Size = UDim2.fromOffset(200, 32),
                     BackgroundTransparency = 1,
                     TextColor3 = Color3.fromRGB(255, 240, 245),
-                    TextStrokeTransparency = 0.25,
+                    TextStrokeTransparency = 0.1,
                     Font = Enum.Font.GothamBold,
                     TextSize = 12,
                     TextWrapped = true,
-                }, billboard)
-                item = { character = character, highlight = highlight, billboard = billboard, label = label }
+                    ZIndex = 1,
+                }, box)
+                local healthTrack = make("Frame", {
+                    Position = UDim2.fromOffset(-6, 0),
+                    Size = UDim2.new(0, 3, 1, 0),
+                    BackgroundColor3 = Color3.fromRGB(35, 35, 40),
+                    BorderSizePixel = 0,
+                    ZIndex = 1,
+                }, box)
+                local healthFill = make("Frame", {
+                    AnchorPoint = Vector2.new(0, 1),
+                    Position = UDim2.fromScale(0, 1),
+                    Size = UDim2.fromScale(1, 1),
+                    BackgroundColor3 = Color3.fromRGB(80, 240, 125),
+                    BorderSizePixel = 0,
+                    ZIndex = 1,
+                }, healthTrack)
+                item = { character = character, box = box, label = label, outline = outline,
+                    healthFill = healthFill, lastLabelTime = -math.huge }
                 espItems[other] = item
             end
-            item.billboard.Adornee = head
-            item.label.Text = string.format("%s (@%s)\n%d HP | %d studs",
-                other.DisplayName, other.Name, math.ceil(humanoid.Health), math.floor(distance))
+
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if not root or not root:IsA("BasePart") then root = head end
+            local actualHead = character:FindFirstChild("Head")
+            if not actualHead or not actualHead:IsA("BasePart") then actualHead = nil end
+            local topPosition = actualHead and (actualHead.Position + Vector3.new(0, actualHead.Size.Y * 0.5 + 0.2, 0))
+                or (root.Position + Vector3.new(0, root.Size.Y * 0.5 + 2, 0))
+            local bottomY = root.Position.Y - root.Size.Y * 0.5 - math.max(humanoid.HipHeight, 1.5)
+            local footFound = false
+            for _, name in ipairs({ "LeftFoot", "RightFoot", "Left Leg", "Right Leg" }) do
+                local foot = character:FindFirstChild(name)
+                if foot and foot:IsA("BasePart") then
+                    local footY = foot.Position.Y - foot.Size.Y * 0.5
+                    bottomY = footFound and math.min(bottomY, footY) or footY
+                    footFound = true
+                end
+            end
+            local bottomPosition = Vector3.new(root.Position.X, bottomY, root.Position.Z)
+            local top = camera:WorldToViewportPoint(topPosition)
+            local bottom = camera:WorldToViewportPoint(bottomPosition)
+            local x, y, width, height = screenBox(top.X, top.Y, top.Z, bottom.X, bottom.Y, bottom.Z, view.X, view.Y)
+            item.box.Visible = x ~= nil
+            if x ~= nil then
+                item.box.Position = UDim2.fromOffset(x, y)
+                item.box.Size = UDim2.fromOffset(width, height)
+                espCounters.drawn = espCounters.drawn + 1
+                local color = relation == "unknown" and Color3.fromRGB(255, 190, 75)
+                    or (relation == "ally" and Color3.fromRGB(90, 170, 255) or Color3.fromRGB(255, 85, 110))
+                item.outline.Color = color
+                item.label.TextColor3 = color
+                local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+                item.healthFill.Size = UDim2.fromScale(1, ratio)
+                if now - item.lastLabelTime >= Config.ESPInterval or item.relation ~= relation then
+                    local tag = relation == "unknown" and " | EQUIPE ?" or (relation == "ally" and " | ALIADO" or "")
+                    item.label.Text = string.format("@%s%s\n%d HP | %d studs",
+                        other.Name, tag, math.ceil(humanoid.Health), math.floor(distance))
+                    item.lastLabelTime = now
+                    item.relation = relation
+                end
+            end
         end
     end
 end
@@ -683,7 +814,7 @@ connect(player.CharacterAdded, function()
     scanElapsed = Config.ScanInterval
 end)
 
-RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, function(dt)
     if not active then
         return
     end
@@ -697,7 +828,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
     scanElapsed = scanElapsed + dt
     espElapsed = espElapsed + dt
     local input = aimInput()
-    local canAim = UserInputService:GetFocusedTextBox() == nil
+    local canAim = UserInputService:GetFocusedTextBox() == nil and not dragging
     if input == "Mouse" and (not mouseAvailable()
         or UserInputService.MouseBehavior == Enum.MouseBehavior.Default) then
         canAim = false
@@ -709,15 +840,15 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
         end
         if target then
             local character, _, head = getEnemy(target)
-            if character then
+            if character and targetScore(camera, target) ~= nil then
                 local origin = camera.CFrame.Position
                 if (head.Position - origin).Magnitude > 0.01 then
                     if input == "Mouse" then
                         local screen, onScreen = camera:WorldToViewportPoint(head.Position)
                         local dx, dy = screen.X - size.X * 0.5, screen.Y - size.Y * 0.5
                         if onScreen and screen.Z > 0 and dx * dx + dy * dy <= Config.FOV * Config.FOV then
-                            local moveX, moveY = computeMouseStep(dx, dy, dt, Config.AimSpeed,
-                                Config.MouseGain, Config.MouseMaxStep, Config.MouseDeadzone)
+                            local _, speed, gain, maxStep, deadzone = strengthSettings(Config.AimStrength)
+                            local moveX, moveY = computeMouseStep(dx, dy, dt, speed, gain, maxStep, deadzone)
                             if moveX ~= 0 or moveY ~= 0 then
                                 local moved = pcall(mouseMover, moveX, moveY)
                                 if not moved then
@@ -733,7 +864,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
                         end
                     else
                         local wanted = CFrame.lookAt(origin, head.Position)
-                        local alpha = 1 - math.exp(-Config.AimSpeed * math.min(dt, 0.1))
+                        local alpha = computeAimAlpha(dt, Config.AimStrength)
                         camera.CFrame = camera.CFrame:Lerp(wanted, alpha)
                     end
                 end
@@ -745,17 +876,30 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
         target = nil
     end
 
+    local espOK, espError = pcall(updateESP, camera)
+    if not espOK then
+        Config.ESP = false
+        clearESP()
+        espNotice = "Falha no ESP. Veja a mensagem no console."
+        espNoticeUntil = os.clock() + 10
+        warn("VANTA ESP v0.2: " .. tostring(espError))
+        refreshUI()
+    end
+
     ringStroke.Color = target and Color3.fromRGB(100, 255, 170) or accent
     if espElapsed >= Config.ESPInterval then
         espElapsed = 0
-        updateESP(camera)
-        if inputNotice and os.clock() < inputNoticeUntil then
+        if espNotice and os.clock() < espNoticeUntil then
+            status.Text = espNotice
+        elseif inputNotice and os.clock() < inputNoticeUntil then
             status.Text = inputNotice
         elseif kickNotice and os.clock() < kickNoticeUntil then
             status.Text = kickNotice
         else
             local targetText = target and ("Alvo: @" .. target.Name) or "Alvo: nenhum"
-            status.Text = targetText .. "\n" .. rosterStatus()
+            local espText = Config.ESP and ("ESP: " .. espCounters.drawn .. "/" .. espCounters.compatible
+                .. " | Equipe ?: " .. espCounters.unknown) or "ESP: OFF"
+            status.Text = targetText .. "\n" .. rosterStatus() .. "\n" .. espText
             if kickGuard.enabled then
                 status.Text = status.Text .. "\nKick local bloqueado: " .. kickGuard.blocked
             end
@@ -764,4 +908,4 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, f
     end
 end)
 
-print("VANTA BloxStrike TESTE carregado. Comece pelo ESP e confira o filtro Equipes. X encerra.")
+print("VANTA BloxStrike v0.2 TESTE carregado. ESP 2D; Forca da mira ajustavel de 20 a 100. X encerra.")
