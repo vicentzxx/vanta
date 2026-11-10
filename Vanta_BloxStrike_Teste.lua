@@ -1,4 +1,4 @@
--- VANTA BloxStrike v0.2 TESTE | Luau / Roblox client
+-- VANTA BloxStrike v0.3 TESTE | Luau / Roblox client
 -- Execute o arquivo inteiro. Mira, ESP e Anti-Kick local comecam desligados.
 -- Adaptacao experimental; ainda sem teste real no BloxStrike/executores.
 -- Anti-Kick local depende de APIs do executor; nao impede banimento ou kick do servidor.
@@ -22,11 +22,11 @@ local Config = {
     ESP = false,
     AntiKick = false,
     WallCheck = true,
-    TeamCheck = true,
+    MyTeam = "Auto",     -- Auto | CT | T. Os dois recursos selecionam apenas adversarios conhecidos.
     FOV = 150,           -- Raio em pixels, a partir do centro da tela.
     MaxDistance = 2500,  -- Distancia em studs.
-    AimStrength = 85,    -- 20 a 100. Em Camera, 100 centraliza diretamente no alvo.
-    AimInput = "Auto",   -- Auto | Mouse | Camera. Auto prefere mouse em PCs sem toque.
+    AimStrength = 100,   -- 20 a 100. Em Camera, 100 centraliza diretamente no alvo.
+    AimInput = "Camera", -- Camera por padrao; evita assumir semantica de mousemoverel no Xeno.
     ScanInterval = 0.03,
     ESPInterval = 0.15,
 }
@@ -158,37 +158,99 @@ local inputNoticeUntil = 0
 local espNotice = nil
 local espNoticeUntil = 0
 local espCounters = { compatible = 0, drawn = 0, unknown = 0 }
+local resolveCharacter
 
 -- BEGIN BLOXSTRIKE_HELPERS
+local TEAM_ALIASES = {
+    ct = "ct", counterterrorist = "ct", counterterrorists = "ct",
+    contraterrorista = "ct", contraterroristas = "ct",
+    t = "t", terrorist = "t", terrorists = "t", terrorista = "t", terroristas = "t",
+}
+local INACTIVE_TEAMS = { spectator = true, spectators = true, spec = true,
+    observer = true, observers = true, lobby = true, neutral = true,
+    unassigned = true, none = true, unknown = true }
 local function normalizeTeam(value)
     if type(value) == "number" then
         if value ~= value or math.abs(value) == math.huge then return nil end
-        return tostring(value)
+        return string.format("%.17g", value)
     end
     if type(value) == "string" then
         local text = value:match("^%s*(.-)%s*$")
+        local numeric = tonumber(text)
+        if numeric ~= nil and numeric == numeric and math.abs(numeric) ~= math.huge then
+            return string.format("%.17g", numeric)
+        end
+        local compact = string.lower(text):gsub("[^%w]", "")
+        if TEAM_ALIASES[compact] then return TEAM_ALIASES[compact] end
+        if INACTIVE_TEAMS[compact] then return nil, "inactive" end
         if text ~= "" then return string.lower(text) end
     end
     return nil
 end
 
--- Consulta somente valores replicados publicamente. Resultado nil significa
--- equipe desconhecida; com o filtro ligado esses jogadores nao sao selecionados.
-local function teamRelation(localPlayer, other)
-    local mine = normalizeTeam(localPlayer:GetAttribute("Team"))
-    local theirs = normalizeTeam(other:GetAttribute("Team"))
-    if mine ~= nil and theirs ~= nil then
-        return mine ~= theirs, "atributo Player"
+local function readAttribute(object, name)
+    if not object or type(object.GetAttribute) ~= "function" then return nil end
+    local ok, value = pcall(object.GetAttribute, object, name)
+    if ok then return value end
+    return nil
+end
+
+local function readPlayerTeam(other)
+    local fallback, source, inactive = nil, nil, false
+    local character = other.Character
+    if not character and type(resolveCharacter) == "function" then character = resolveCharacter(other) end
+    for _, entry in ipairs({ { other, "Player" }, { character, "Character" } }) do
+        for _, key in ipairs({ "Team", "TeamName", "Side", "Faction", "team", "teamName", "side", "faction" }) do
+            local side, kind = normalizeTeam(readAttribute(entry[1], key))
+            if side == "ct" or side == "t" then return side, entry[2] .. "." .. key end
+            if kind == "inactive" then inactive = true end
+            if side and fallback == nil then fallback, source = side, entry[2] .. "." .. key end
+        end
     end
-    local myCharacter, theirCharacter = localPlayer.Character, other.Character
-    mine = myCharacter and normalizeTeam(myCharacter:GetAttribute("Team"))
-    theirs = theirCharacter and normalizeTeam(theirCharacter:GetAttribute("Team"))
-    if mine ~= nil and theirs ~= nil then
-        return mine ~= theirs, "atributo Character"
+    if other.Team ~= nil and not other.Neutral then
+        local side, kind = normalizeTeam(other.Team.Name)
+        if side == "ct" or side == "t" then return side, "Player.Team" end
+        if kind == "inactive" then inactive = true end
+        if side and fallback == nil then fallback, source = side, "Player.Team" end
     end
-    if not localPlayer.Neutral and not other.Neutral
+    if inactive then return nil, "inactive" end
+    return fallback, source or "desconhecida"
+end
+
+local function teamColorKey(other)
+    local color = other.TeamColor
+    if not color or type(color.Name) ~= "string" then return nil end
+    local name = string.lower(color.Name):gsub("[^%w]", "")
+    if name == "" or name == "white" or name == "institutionalwhite" or name == "mediumstonegrey" then
+        return nil
+    end
+    return tostring(color.Number or color.Name)
+end
+
+-- Um lado desconhecido nunca e tratado como inimigo. CT e T sao canonizados
+-- para que, por exemplo, CT e Counter-Terrorists representem a mesma equipe.
+local function teamRelation(localPlayer, other, override)
+    local mine, mineSource
+    if override and override ~= "Auto" then
+        mine, mineSource = normalizeTeam(override), "manual"
+    else
+        mine, mineSource = readPlayerTeam(localPlayer)
+    end
+    local theirs, theirSource = readPlayerTeam(other)
+    if mineSource == "inactive" or theirSource == "inactive" then return false, "fora da rodada" end
+    if mine ~= nil and theirs ~= nil then
+        local mineCanonical = mine == "ct" or mine == "t"
+        local theirCanonical = theirs == "ct" or theirs == "t"
+        if mineCanonical ~= theirCanonical then return nil, "equipe desconhecida" end
+        return mine ~= theirs, "equipes reconhecidas"
+    end
+    if mine == nil and theirs == nil and not localPlayer.Neutral and not other.Neutral
         and localPlayer.Team ~= nil and other.Team ~= nil then
         return localPlayer.Team ~= other.Team, "Teams"
+    end
+    local mineColor, theirColor = teamColorKey(localPlayer), teamColorKey(other)
+    if mineColor ~= nil and theirColor ~= nil then
+        return mineColor ~= theirColor, "Player.TeamColor"
     end
     return nil, "desconhecida"
 end
@@ -220,10 +282,8 @@ local function computeAimAlpha(dt, strength)
     return 1 - math.exp(-speed * math.min(dt, 0.1))
 end
 
-local function espRelation(enemy, teamCheck)
-    if teamCheck and enemy == false then return nil end
-    if enemy == nil then return "unknown" end
-    return enemy and "enemy" or "ally"
+local function espRelation(enemy)
+    return enemy == true and "enemy" or nil
 end
 
 -- Projecao 2D sem dependencia de Highlight, BillboardGui ou Drawing do executor.
@@ -357,7 +417,7 @@ local dragHandle = make("TextLabel", {
     Size = UDim2.fromOffset(154, 40),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "VANTA | BLOX v0.2",
+    Text = "VANTA | BLOX v0.3",
     TextColor3 = Color3.fromRGB(240, 240, 248),
     Font = Enum.Font.GothamBold,
     TextSize = 13,
@@ -396,10 +456,10 @@ local body = make("ScrollingFrame", {
     ZIndex = 3,
 }, panel)
 local aimButton = button(body, "Mira: OFF", UDim2.fromOffset(216, 34))
-local espButton = button(body, "ESP: OFF", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 40))
+local espButton = button(body, "ESP inimigos: OFF", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 40))
 local wallButton = button(body, "Checar paredes: ON", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 80))
 local kickButton = button(body, "Anti-Kick local: OFF", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 120))
-local teamButton = button(body, "Equipes: ON", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 160))
+local teamButton = button(body, "Minha equipe: Auto", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 160))
 local inputButton = button(body, "Mira: Auto", UDim2.fromOffset(216, 34), UDim2.fromOffset(0, 200))
 local less = button(body, "-", UDim2.fromOffset(38, 32), UDim2.fromOffset(0, 240))
 local more = button(body, "+", UDim2.fromOffset(38, 32), UDim2.fromOffset(178, 240))
@@ -455,13 +515,14 @@ end
 
 local function refreshUI()
     paintButton(aimButton, Config.Aim, "Mira")
-    paintButton(espButton, Config.ESP, "ESP")
+    paintButton(espButton, Config.ESP, "ESP inimigos")
     paintButton(wallButton, Config.WallCheck, "Checar paredes")
     paintButton(kickButton, kickGuard.enabled, "Anti-Kick local")
     if kickGuard.error then
         kickButton.Text = "Anti-Kick: indisponivel"
     end
-    paintButton(teamButton, Config.TeamCheck, "Equipes")
+    local side = Config.MyTeam ~= "Auto" and normalizeTeam(Config.MyTeam) or readPlayerTeam(player)
+    teamButton.Text = "Minha equipe: " .. (side and string.upper(side) or "Auto (?)")
     inputButton.Text = "Entrada: " .. Config.AimInput .. " (" .. aimInput() .. ")"
     fovLabel.Text = "FOV: " .. Config.FOV
     strengthLabel.Text = "Forca: " .. Config.AimStrength .. "%"
@@ -505,7 +566,9 @@ connect(kickButton.Activated, function()
     refreshUI()
 end)
 connect(teamButton.Activated, function()
-    Config.TeamCheck = not Config.TeamCheck
+    if Config.MyTeam == "Auto" then Config.MyTeam = "CT"
+    elseif Config.MyTeam == "CT" then Config.MyTeam = "T"
+    else Config.MyTeam = "Auto" end
     target = nil
     scanElapsed = Config.ScanInterval
     clearESP()
@@ -591,29 +654,84 @@ connect(UserInputService.InputEnded, function(input)
     end
 end)
 
-local function localAlive()
-    local character = player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    return humanoid and humanoid.Health > 0
+-- BEGIN CHARACTER_RESOLVER
+local function finiteHealth(value)
+    local number = tonumber(value)
+    if number == nil or number ~= number or math.abs(number) == math.huge then return nil end
+    return number
 end
 
--- BEGIN CHARACTER_RESOLVER
-local function characterParts(other)
-    local character = other.Character
-    if not character or not character:IsDescendantOf(Workspace) then
-        return nil
-    end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health <= 0 then
-        return nil
-    end
-    for _, name in ipairs({ "Head", "UpperTorso", "Torso", "HumanoidRootPart" }) do
+local function findBodyPart(character)
+    for _, name in ipairs({ "Head", "HeadHB", "UpperTorso", "Torso", "HumanoidRootPart" }) do
         local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") then return part end
+    end
+    -- Alguns personagens mantem suas partes dentro de um submodelo.
+    for _, name in ipairs({ "Head", "HeadHB", "UpperTorso", "Torso", "HumanoidRootPart" }) do
+        local part = character:FindFirstChild(name, true)
         if part and part:IsA("BasePart") then
-            return character, humanoid, part
+            local tool = type(part.FindFirstAncestorOfClass) == "function" and part:FindFirstAncestorOfClass("Tool")
+            local accessory = type(part.FindFirstAncestorOfClass) == "function" and part:FindFirstAncestorOfClass("Accessory")
+            if not tool and not accessory then return part end
         end
     end
     return nil
+end
+
+resolveCharacter = function(other)
+    local character = other.Character
+    if character and character.Parent and findBodyPart(character) then return character end
+    if type(Workspace.FindFirstChild) == "function" then
+        for _, folderName in ipairs({ "Characters", "Players", "PlayerCharacters" }) do
+            local folder = Workspace:FindFirstChild(folderName)
+            if folder then
+                local model = folder:FindFirstChild(other.Name)
+                    or (other.UserId and folder:FindFirstChild(tostring(other.UserId)))
+                if model and model.Parent and findBodyPart(model) then return model end
+            end
+        end
+        local model = other.Name and Workspace:FindFirstChild(other.Name)
+        if model and model.Parent and findBodyPart(model) then return model end
+    end
+    return character and character.Parent and character or nil
+end
+
+local function lifeData(character, owner)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid and character and type(character.FindFirstChildWhichIsA) == "function" then
+        humanoid = character:FindFirstChildWhichIsA("Humanoid", true)
+    end
+    local health = finiteHealth(readAttribute(character, "Health"))
+        or finiteHealth(readAttribute(owner, "Health"))
+    local attributeHealth = health ~= nil
+    local alive = readAttribute(character, "Alive")
+    if alive == nil then alive = readAttribute(owner, "Alive") end
+    if health == nil and humanoid and alive ~= true then health = finiteHealth(humanoid.Health) end
+    local dead = alive == false or (health ~= nil and health <= 0)
+    local maxHealth = finiteHealth(readAttribute(character, "MaxHealth"))
+        or finiteHealth(readAttribute(owner, "MaxHealth"))
+        or (humanoid and finiteHealth(humanoid.MaxHealth))
+    local hipHeight = humanoid and finiteHealth(humanoid.HipHeight) or 2
+    return { Health = health, MaxHealth = maxHealth, HipHeight = hipHeight or 2,
+        humanoid = humanoid, LifeKnown = attributeHealth or health ~= nil or alive ~= nil }, dead
+end
+
+local function characterParts(other)
+    local character = resolveCharacter(other)
+    if not character then return nil, nil, nil, "sem modelo" end
+    local part = findBodyPart(character)
+    if not part then return nil, nil, nil, "sem partes" end
+    local stats, dead = lifeData(character, other)
+    if dead then return nil, nil, nil, "morto" end
+    return character, stats, part
+end
+
+local function localAlive(owner)
+    owner = owner or player
+    local _, dead = lifeData(resolveCharacter(owner), owner)
+    -- Um FPS pode manter so o viewmodel local. Ausencia de corpo nao significa morte.
+    -- Vida zero ou Alive=false continuam interrompendo a mira.
+    return not dead
 end
 -- END CHARACTER_RESOLVER
 
@@ -621,35 +739,33 @@ local function getEnemy(other)
     if other == player or other.Parent ~= Players then
         return nil
     end
-    if Config.TeamCheck then
-        local enemy = teamRelation(player, other)
-        if enemy ~= true then return nil end
-    end
+    local enemy = teamRelation(player, other, Config.MyTeam)
+    if enemy ~= true then return nil end
     return characterParts(other)
 end
 
 local function rosterStatus()
-    local ready, unknown = 0, 0
+    local listed, models, ready, unknown = 0, 0, 0, 0
     for _, other in ipairs(Players:GetPlayers()) do
-        if other ~= player and characterParts(other) then
-            ready = ready + 1
-            if Config.TeamCheck and teamRelation(player, other) == nil then
-                unknown = unknown + 1
+        if other ~= player then
+            listed = listed + 1
+            if resolveCharacter(other) then models = models + 1 end
+            if characterParts(other) then
+                ready = ready + 1
+                if teamRelation(player, other, Config.MyTeam) == nil then unknown = unknown + 1 end
             end
         end
     end
-    if ready == 0 then return "Aguardando personagens compativeis." end
-    if unknown > 0 then return "Equipe indefinida: " .. unknown .. " jogador(es)." end
-    return "Personagens detectados: " .. ready
+    return "Jogadores: " .. listed .. " | Modelos: " .. models .. "\nAlvos com partes: " .. ready .. " | Equipe ?: " .. unknown
 end
 
 local function getESPCharacter(other)
     if other == player or other.Parent ~= Players then return nil end
     local character, humanoid, part = characterParts(other)
     if not character then return nil end
-    local enemy = teamRelation(player, other)
-    local relation = espRelation(enemy, Config.TeamCheck)
-    if not relation then return nil end
+    local enemy = teamRelation(player, other, Config.MyTeam)
+    local relation = espRelation(enemy)
+    if not relation then return nil, nil, nil, enemy == nil and "unknown" or "ally" end
     return character, humanoid, part, relation
 end
 
@@ -708,12 +824,12 @@ local function updateESP(camera)
     local view = camera.ViewportSize
     for _, other in ipairs(Players:GetPlayers()) do
         local character, humanoid, head, relation = getESPCharacter(other)
+        if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
         local distance = head and (head.Position - camera.CFrame.Position).Magnitude or math.huge
         if not character or distance > Config.MaxDistance then
             removeESP(other)
         else
             espCounters.compatible = espCounters.compatible + 1
-            if relation == "unknown" then espCounters.unknown = espCounters.unknown + 1 end
             local item = espItems[other]
             if item and item.character ~= character then
                 removeESP(other)
@@ -740,23 +856,8 @@ local function updateESP(camera)
                     TextWrapped = true,
                     ZIndex = 1,
                 }, box)
-                local healthTrack = make("Frame", {
-                    Position = UDim2.fromOffset(-6, 0),
-                    Size = UDim2.new(0, 3, 1, 0),
-                    BackgroundColor3 = Color3.fromRGB(35, 35, 40),
-                    BorderSizePixel = 0,
-                    ZIndex = 1,
-                }, box)
-                local healthFill = make("Frame", {
-                    AnchorPoint = Vector2.new(0, 1),
-                    Position = UDim2.fromScale(0, 1),
-                    Size = UDim2.fromScale(1, 1),
-                    BackgroundColor3 = Color3.fromRGB(80, 240, 125),
-                    BorderSizePixel = 0,
-                    ZIndex = 1,
-                }, healthTrack)
                 item = { character = character, box = box, label = label, outline = outline,
-                    healthFill = healthFill, lastLabelTime = -math.huge }
+                    lastLabelTime = -math.huge }
                 espItems[other] = item
             end
 
@@ -785,16 +886,11 @@ local function updateESP(camera)
                 item.box.Position = UDim2.fromOffset(x, y)
                 item.box.Size = UDim2.fromOffset(width, height)
                 espCounters.drawn = espCounters.drawn + 1
-                local color = relation == "unknown" and Color3.fromRGB(255, 190, 75)
-                    or (relation == "ally" and Color3.fromRGB(90, 170, 255) or Color3.fromRGB(255, 85, 110))
+                local color = Color3.fromRGB(255, 85, 110)
                 item.outline.Color = color
                 item.label.TextColor3 = color
-                local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
-                item.healthFill.Size = UDim2.fromScale(1, ratio)
                 if now - item.lastLabelTime >= Config.ESPInterval or item.relation ~= relation then
-                    local tag = relation == "unknown" and " | EQUIPE ?" or (relation == "ally" and " | ALIADO" or "")
-                    item.label.Text = string.format("@%s%s\n%d HP | %d studs",
-                        other.Name, tag, math.ceil(humanoid.Health), math.floor(distance))
+                    item.label.Text = "@" .. other.Name
                     item.lastLabelTime = now
                     item.relation = relation
                 end
@@ -882,7 +978,7 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
         clearESP()
         espNotice = "Falha no ESP. Veja a mensagem no console."
         espNoticeUntil = os.clock() + 10
-        warn("VANTA ESP v0.2: " .. tostring(espError))
+        warn("VANTA ESP v0.3: " .. tostring(espError))
         refreshUI()
     end
 
@@ -904,8 +1000,10 @@ RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value + 1, fun
                 status.Text = status.Text .. "\nKick local bloqueado: " .. kickGuard.blocked
             end
             inputButton.Text = "Entrada: " .. Config.AimInput .. " (" .. input .. ")"
+            local side = Config.MyTeam ~= "Auto" and normalizeTeam(Config.MyTeam) or readPlayerTeam(player)
+            teamButton.Text = "Minha equipe: " .. (side and string.upper(side) or "Auto (?)")
         end
     end
 end)
 
-print("VANTA BloxStrike v0.2 TESTE carregado. ESP 2D; Forca da mira ajustavel de 20 a 100. X encerra.")
+print("VANTA BloxStrike v0.3 TESTE carregado. Somente adversarios; Camera por padrao. X encerra.")
